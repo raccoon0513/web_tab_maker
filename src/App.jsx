@@ -1,4 +1,30 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+function useHistory(initialState) {
+  const [history, setHistory] = useState([initialState]);
+  const [pointer, setPointer] = useState(0);
+
+  const set = useCallback((valOrFunc) => {
+    setHistory((prevHistory) => {
+      const currentState = prevHistory[pointer];
+      const newState = typeof valOrFunc === 'function' ? valOrFunc(currentState) : valOrFunc;
+      
+      // 배열의 얕은 복사/깊은 복사 문제 방지를 위해 직렬화 비교 (필요시 최적화 가능)
+      if (JSON.stringify(currentState) === JSON.stringify(newState)) return prevHistory;
+
+      // 과거 상태에서 새로운 행동을 하면, 그 이후의 미래(Redo)는 날리고 새로운 기록 추가
+      const newHistory = prevHistory.slice(0, pointer + 1);
+      newHistory.push(newState);
+      setPointer(newHistory.length - 1);
+      return newHistory;
+    });
+  }, [pointer]);
+
+  const undo = useCallback(() => setPointer((prev) => Math.max(0, prev - 1)), []);
+  const redo = useCallback(() => setPointer((prev) => (setHistory(h => { Math.min(h.length - 1, prev + 1); return h; }), Math.min(history.length - 1, prev + 1))), [history.length]);
+
+  return [history[pointer], set, undo, redo];
+}
+
 
 // --- 초기 샘플 데이터 설정 ---
 const initialScore = [
@@ -47,7 +73,11 @@ const BOTTOM_ROW = [
 ];
 
 export default function TabEditor() {
-  const [score, setScore] = useState(initialScore);
+  const [score, setScore, undoScore, redoScore] = useHistory([ { id: 1, beats: [] } ]);
+  const [editorMode, setEditorMode] = useState('INPUT'); // 'INPUT', 'SELECT', 'SYMBOL'
+  const [selectedNotes, setSelectedNotes] = useState([]); // 선택된 노트 배열: [{ mIndex, time, string }]
+  const [isDebugMode, setIsDebugMode] = useState(false); // 박자 시각화 토글
+  
   const [cursor, setCursor] = useState({ mIndex: 0, time: 0 });
   const [durIdx, setDurIdx] = useState(2); 
   const [isDotted, setIsDotted] = useState(false);
@@ -183,6 +213,60 @@ export default function TabEditor() {
   };
 
   const handleKeyDown = useCallback((e) => {
+    useEffect(() => {
+    const handleKeyDown = (e) => {
+      // 💡 1. Undo / Redo 처리 (최우선 순위)
+      if (e.ctrlKey && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          redoScore(); // Ctrl + Shift + Z
+        } else {
+          undoScore(); // Ctrl + Z
+        }
+        return;
+      }
+
+      // 💡 2. 모드 전환 토글
+      if (e.key === '`') {
+        e.preventDefault();
+        setEditorMode(prev => prev === 'SELECT' ? 'INPUT' : 'SELECT');
+        setSelectedNotes([]); // 선택 모드 종료 시 선택 해제
+        return;
+      }
+
+      if (e.key === ']') {
+        e.preventDefault();
+        setEditorMode(prev => prev === 'SYMBOL' ? 'INPUT' : 'SYMBOL');
+        return;
+      }
+
+      // 💡 디버그 뷰 모드 토글 (선택사항: 'D' 키와 Ctrl 조합 등으로 할당 가능, 여기선 임시로 Shift+D)
+      if (e.shiftKey && e.key === 'D') {
+        e.preventDefault();
+        setIsDebugMode(prev => !prev);
+        return;
+      }
+
+      // 💡 3. 현재 모드에 따른 로직 분기
+      if (editorMode === 'SELECT') {
+        handleSelectModeInput(e);
+        return;
+      }
+
+      if (editorMode === 'SYMBOL') {
+        handleSymbolModeInput(e);
+        return;
+      }
+
+      // --- 아래부터는 기존 INPUT 모드 로직 (방향키 이동, 키보드 입력 등) ---
+      // (기존 화살표 이동 및 insertChord 로직 유지)
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [score, cursor, durIdx, isDotted, editorMode, selectedNotes, undoScore, redoScore]); 
+  // 의존성 배열(deps)에 새로 추가된 상태들을 넣어주어야 합니다.
+  
     const key = e.key.toLowerCase();
     if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
 
