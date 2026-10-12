@@ -49,7 +49,23 @@ const BOTTOM_ROW = [
 ];
 
 export default function TabEditor() {
-  const [score, setScore] = useState([ { id: 1, beats: [] } ]);
+  // 💡 1. 로컬 스토리지(캐시)에서 데이터 자동 불러오기 (지연 초기화)
+  const [score, setScore] = useState(() => {
+    const savedScore = localStorage.getItem('tabEditorScore');
+    if (savedScore) {
+      try {
+        return JSON.parse(savedScore);
+      } catch (e) {
+        console.error("캐시 데이터를 읽는 중 오류가 발생했습니다.", e);
+      }
+    }
+    return [ { id: 1, beats: [] } ];
+  });
+
+  // 💡 2. score 상태가 바뀔 때마다 자동으로 캐시에 저장
+  useEffect(() => {
+    localStorage.setItem('tabEditorScore', JSON.stringify(score));
+  }, [score]);
   const [editorMode, setEditorMode] = useState('INPUT'); // 'INPUT', 'SELECT', 'SYMBOL'
   const [selectedNotes, setSelectedNotes] = useState([]); // 선택된 노트 배열: [{ mIndex, time, string }]
   const [isDebugMode, setIsDebugMode] = useState(false); // 박자 시각화 토글
@@ -63,6 +79,50 @@ export default function TabEditor() {
   const [activeUIKeys, setActiveUIKeys] = useState(new Set());
   const activeKeysRef = useRef(new Set()); 
   const chordAccumulatorRef = useRef(new Set()); 
+
+  // 💡 3. JSON 파일로 내보내기
+  const handleExportJSON = () => {
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(score, null, 2));
+    const downloadAnchorNode = document.createElement('a');
+    downloadAnchorNode.setAttribute("href", dataStr);
+    downloadAnchorNode.setAttribute("download", "guitar_tab_score.json");
+    document.body.appendChild(downloadAnchorNode);
+    downloadAnchorNode.click();
+    downloadAnchorNode.remove();
+    showToast("JSON 파일로 저장되었습니다.");
+  };
+
+  // 💡 4. JSON 파일 불러오기
+  const handleImportJSON = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const parsed = JSON.parse(event.target.result);
+        if (Array.isArray(parsed)) {
+          setScore(parsed);
+          setSelectedNotes([]);
+          setCursor({ mIndex: 0, time: 0 });
+          showToast("악보를 성공적으로 불러왔습니다.");
+        }
+      } catch (err) {
+        showToast("잘못된 형식의 파일입니다.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = null; // 같은 파일을 다시 불러올 수 있도록 input 초기화
+  };
+
+  // 💡 5. 악보 완전 초기화
+  const handleResetScore = () => {
+    if (window.confirm("모든 악보 데이터가 삭제됩니다. 정말 초기화하시겠습니까?")) {
+      setScore([ { id: 1, beats: [] } ]);
+      setSelectedNotes([]);
+      setCursor({ mIndex: 0, time: 0 });
+      showToast("악보가 초기화되었습니다.");
+    }
+  };
 
   const showToast = (msg) => {
     setToastMsg(msg);
@@ -761,7 +821,27 @@ export default function TabEditor() {
         </div>
       )}
 
-      <h2 style={{ marginBottom: '10px' }}>Guitar TAB Editor (Pro)</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: '15px' }}>
+        <h2 style={{ margin: 0 }}>Guitar TAB Editor (Pro)</h2>
+        
+        {/* 💡 데이터 관리 버튼 그룹 */}
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <button 
+            onClick={handleExportJSON}
+            style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}
+          >💾 JSON 내보내기</button>
+          
+          <label style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>
+            📂 JSON 불러오기
+            <input type="file" accept=".json" style={{ display: 'none' }} onChange={handleImportJSON} />
+          </label>
+          
+          <button 
+            onClick={handleResetScore}
+            style={{ padding: '8px 12px', backgroundColor: '#ef4444', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}
+          >🗑️ 초기화</button>
+        </div>
+      </div>
       
       <div style={{ backgroundColor: '#fff', padding: '20px', borderRadius: '8px', boxShadow: '0 2px 10px rgba(0,0,0,0.1)' }}>
         {layout.map((lineChunks, lineIdx) => (
