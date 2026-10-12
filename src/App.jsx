@@ -20,6 +20,66 @@ const HEIGHT = TOP_PADDING + STRING_SPACING * 5 + 30;
 
 const TUNING = { 1: 64, 2: 59, 3: 55, 4: 50, 5: 45, 6: 40 };
 
+// 💡 오디오 컨텍스트 및 타이머 전역 관리
+let audioCtx = null;
+let playbackTimers = [];
+
+// 💡 삼각파(Triangle)와 볼륨 감쇠(ADSR)를 이용한 기타 튕기는 소리 합성
+const playTone = (midi, startTime, durationInSeconds) => {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  const frequency = 440 * Math.pow(2, (midi - 69) / 12);
+  const osc = audioCtx.createOscillator();
+  const gainNode = audioCtx.createGain();
+
+  osc.type = 'triangle'; 
+  osc.frequency.value = frequency;
+
+  // 소리 볼륨(엔벨롭) 깎기: 치는 순간 커지고 서서히 줄어듦
+  gainNode.gain.setValueAtTime(0, startTime);
+  gainNode.gain.linearRampToValueAtTime(0.8, startTime + 0.02); 
+  gainNode.gain.exponentialRampToValueAtTime(0.001, startTime + durationInSeconds + 0.5); // 여음을 위해 0.5초 추가
+
+  osc.connect(gainNode);
+  gainNode.connect(audioCtx.destination);
+
+  osc.start(startTime);
+  osc.stop(startTime + durationInSeconds + 0.5);
+};
+
+// 💡 화이트 노이즈와 대역통과 필터를 이용한 퍼커시브(챱챱) 소리 합성
+const playPercussiveMute = (startTime) => {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  
+  // 1. 0.05초 길이의 지직거리는 노이즈(백색 소음) 버퍼 생성
+  const bufferSize = audioCtx.sampleRate * 0.05; 
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    data[i] = Math.random() * 2 - 1;
+  }
+  
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = buffer;
+
+  // 2. 대역통과 필터(Bandpass)로 기타 줄 때리는 대역의 소리만 예쁘게 깎아냄
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = 1200; // 챱챱거리는 질감을 살리는 주파수 대역
+  filter.Q.value = 1;
+
+  // 3. 엔벨롭 (아주 짧고 강하게 끊어침)
+  const gainNode = audioCtx.createGain();
+  gainNode.gain.setValueAtTime(1.5, startTime); 
+  gainNode.gain.exponentialRampToValueAtTime(0.01, startTime + 0.04); 
+
+  noise.connect(filter);
+  filter.connect(gainNode);
+  gainNode.connect(audioCtx.destination);
+
+  noise.start(startTime);
+};
+
 // 키보드 매핑
 const PIANO_MAP = {
   'z' : 48, 's' : 49, 'x' : 50, 'd' : 51, 
@@ -76,6 +136,10 @@ export default function TabEditor() {
   const [toastMsg, setToastMsg] = useState(null);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   
+  // 💡 재생 관련 상태 (준비 단계)
+  const [bpm, setBpm] = useState(120);
+  const [playbackState, setPlaybackState] = useState('STOPPED'); // 'STOPPED', 'PLAYING', 'PAUSED'
+
   const [activeUIKeys, setActiveUIKeys] = useState(new Set());
   const activeKeysRef = useRef(new Set()); 
   const chordAccumulatorRef = useRef(new Set()); 
@@ -129,6 +193,71 @@ export default function TabEditor() {
     setTimeout(() => setToastMsg(null), 2000);
   };
 
+  // 💡 정지 로직: 예약된 오디오와 시각적 커서 타이머 모두 초기화
+  const handleStop = useCallback(() => {
+    if (audioCtx) {
+      audioCtx.close(); 
+      audioCtx = null;
+    }
+    playbackTimers.forEach(clearTimeout);
+    playbackTimers = [];
+    setPlaybackState('STOPPED');
+  }, []);
+
+  // 💡 재생 로직: 악보를 읽어 시간순으로 오디오 스케줄링
+  const handlePlay = useCallback((fromCursor = false) => {
+    handleStop(); // 기존 재생 중이던 소리 강제 종료
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    setPlaybackState('PLAYING');
+    setSelectedNotes([]); // 재생 중 선택 박스 방해 방지
+
+    const secondsPerBeat = 60 / bpm;
+    const startAbsoluteTime = fromCursor ? (cursor.mIndex * 4 + cursor.time) : 0; 
+    const ctxStartTime = audioCtx.currentTime + 0.1; 
+
+    let maxEndTime = 0;
+
+    score.forEach((measure, mIndex) => {
+      measure.beats.forEach(beat => {
+        const absTime = mIndex * 4 + beat.time;
+        
+        if (absTime >= startAbsoluteTime) {
+          const timeOffset = absTime - startAbsoluteTime; 
+          const startTimeInSec = ctxStartTime + (timeOffset * secondsPerBeat);
+          const durationInSec = beat.duration * secondsPerBeat;
+
+          // 1. 화음 내의 모든 노트를 동시에 스케줄링
+          Object.entries(beat.notes).forEach(([string, fret]) => {
+            if (fret === 'X') {
+              // 💡 'X'일 때는 음표 대신 퍼커시브 챱챱 사운드 재생
+              playPercussiveMute(startTimeInSec);
+            } else {
+              // 일반 숫자 프렛일 때는 기존 기타 사운드 재생
+              const strNum = parseInt(string, 10);
+              const midi = TUNING[strNum] + fret;
+              playTone(midi, startTimeInSec, durationInSec);
+            }
+          });
+
+          // 2. 소리가 나는 타이밍에 맞춰 파란색 진행 바(Cursor) 이동
+          const timer = setTimeout(() => {
+            setCursor({ mIndex: measure.id - 1, time: beat.time });
+          }, (startTimeInSec - audioCtx.currentTime) * 1000);
+          playbackTimers.push(timer);
+
+          if (startTimeInSec + durationInSec > maxEndTime) {
+            maxEndTime = startTimeInSec + durationInSec;
+          }
+        }
+      });
+    });
+
+    const endTimer = setTimeout(() => {
+      setPlaybackState('STOPPED');
+    }, (maxEndTime - audioCtx.currentTime) * 1000);
+    playbackTimers.push(endTimer);
+
+  }, [score, bpm, cursor, handleStop]);
   const layout = useMemo(() => {
     const lines = [];
     let currentLineChunks = [];
@@ -250,7 +379,37 @@ export default function TabEditor() {
   };
 
   const handleSelectModeInput = (e) => {
-    e.preventDefault(); 
+    // 💡 [기능 0] Delete / Backspace: 선택된 노트만 정밀 삭제
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault();
+      if (selectedNotes.length === 0) return;
+
+      setScore(prev => {
+        let newScore = JSON.parse(JSON.stringify(prev));
+        
+        selectedNotes.forEach(sel => {
+          const measure = newScore[sel.mIndex];
+          if (!measure) return;
+          
+          const beatIdx = measure.beats.findIndex(b => b.time === sel.time);
+          if (beatIdx !== -1) {
+            const beat = measure.beats[beatIdx];
+            
+            // 💡 해당 줄(String)의 노트만 삭제 (화음의 다른 노트는 보존)
+            delete beat.notes[sel.string];
+            
+            // 만약 지우고 났더니 해당 박자에 남은 노트가 하나도 없다면 비트 자체를 삭제
+            if (Object.keys(beat.notes).length === 0) {
+              measure.beats.splice(beatIdx, 1);
+            }
+          }
+        });
+        return newScore;
+      });
+
+      setSelectedNotes([]); // 삭제 후 선택 해제
+      return;
+    }
 
     let allNotes = [];
     score.forEach((measure) => {
@@ -542,10 +701,35 @@ export default function TabEditor() {
   };
 
   
-
-  // 💡 2. 기호 모드 (SYMBOL) 컨트롤러 (임시)
+  // 💡 2. 기호 모드 (SYMBOL) 컨트롤러
   const handleSymbolModeInput = (e) => {
-    // 뮤트(X), 쉼표(/) 로직 추가 예정
+    const key = e.key;
+    // 숫자 1~6을 누르면 해당 줄에 뮤트(X) 기호 추가
+    if (['1', '2', '3', '4', '5', '6'].includes(key)) {
+      const stringNum = parseInt(key, 10);
+      const step = DURATION_STEPS[durIdx] * (isDotted ? 1.5 : 1);
+      
+      setScore(prev => {
+        let newScore = JSON.parse(JSON.stringify(prev));
+        let cMeasure = newScore[cursor.mIndex];
+        
+        if (!cMeasure) {
+          while (newScore.length <= cursor.mIndex) {
+            newScore.push({ id: newScore.length + 1, beats: [] });
+          }
+          cMeasure = newScore[cursor.mIndex];
+        }
+        
+        let beat = cMeasure.beats.find(b => b.time === cursor.time);
+        if (!beat) {
+          beat = { time: cursor.time, duration: step, notes: {} };
+          cMeasure.beats.push(beat);
+        }
+        
+        beat.notes[stringNum] = 'X';
+        return newScore;
+      });
+    }
   };
 
 
@@ -696,11 +880,11 @@ export default function TabEditor() {
 
     return (
       <div style={{
-        position: 'relative', width: '38px', height: '90px', 
+        position: 'relative', width: '38px', height: '35px',  // 💡 높이 90px -> 35px로 축소
         backgroundColor: isWActive ? '#3b82f6' : '#fff', 
-        border: '1px solid #ccc', borderRadius: '0 0 6px 6px', 
+        border: '1px solid #ccc', borderRadius: '0 0 4px 4px', 
         display: 'flex', alignItems: 'flex-end', justifyContent: 'center', 
-        paddingBottom: '10px', fontWeight: 'bold', 
+        paddingBottom: '3px', fontWeight: 'bold', fontSize: '11px',
         color: isWActive ? '#fff' : '#666', zIndex: 1
       }}>
         {whiteLabel.toUpperCase()}
@@ -708,11 +892,11 @@ export default function TabEditor() {
         {blackLabel && (
           <div style={{
             position: 'absolute', top: 0, right: '-12px', 
-            width: '24px', height: '55px', 
+            width: '24px', height: '20px', // 💡 흑건 높이 55px -> 20px로 축소
             backgroundColor: isBActive ? '#3b82f6' : '#222', 
-            borderRadius: '0 0 4px 4px', 
+            borderRadius: '0 0 3px 3px', 
             display: 'flex', alignItems: 'flex-end', justifyContent: 'center', 
-            paddingBottom: '5px', color: '#fff', fontSize: '11px', zIndex: 10
+            paddingBottom: '2px', color: '#fff', fontSize: '9px', zIndex: 10
           }}>
             {blackLabel.toUpperCase()}
           </div>
@@ -730,116 +914,55 @@ export default function TabEditor() {
         </div>
       )}
       
-      {/* 💡 모드 상태 인디케이터 & 퀵 가이드 */}
-      <div style={{ 
-        position: 'fixed', top: '20px', right: '20px', 
-        backgroundColor: editorMode === 'INPUT' ? '#3b82f6' : (editorMode === 'SELECT' ? '#10b981' : '#f59e0b'), 
-        color: '#fff', padding: '14px 20px', borderRadius: '12px', 
-        boxShadow: '0 4px 15px rgba(0,0,0,0.2)', zIndex: 1000,
-        display: 'flex', flexDirection: 'column', gap: '8px', transition: 'background-color 0.3s'
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 'bold', fontSize: '15px' }}>
-          <div style={{ width: '10px', height: '10px', backgroundColor: '#fff', borderRadius: '50%', opacity: 0.9 }} />
-          {editorMode === 'INPUT' && '통상 (INPUT) 모드'}
-          {editorMode === 'SELECT' && '선택 (SELECT) 모드'}
-          {editorMode === 'SYMBOL' && '특수 기호 (SYMBOL) 모드'}
-        </div>
-        <div style={{ fontSize: '12px', opacity: 0.9, lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>
-          {editorMode === 'INPUT' && '방향키 ↔ : 커서 이동\n방향키 ↕ : 박자 조절 (- / =)\n건반(Z~P) : 음표 입력'}
-          {editorMode === 'SELECT' && '방향키 ↔ : 순차 탐색\nAlt + ↕ : 반음 조절\nShift + ↕ : 옥타브 조절\nCtrl + ↕ : 프렛 유지 줄 이동'}
-          {editorMode === 'SYMBOL' && '숫자 1~6 : 뮤트(X) 입력\n숫자 7 : 소리 끊음(/) 입력'}
-        </div>
-      </div>
-
-      {/* 💡 왼쪽 엣지 헬프 버튼 */}
-      <div 
-        onClick={() => setIsHelpOpen(true)}
-        style={{
-          position: 'fixed', left: 0, top: '50%', transform: 'translateY(-50%)',
-          width: '28px', height: '100px', backgroundColor: '#333', color: '#fff',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          cursor: 'pointer', borderTopRightRadius: '8px', borderBottomRightRadius: '8px',
-          boxShadow: '2px 0 8px rgba(0,0,0,0.2)', zIndex: 1000, transition: 'background-color 0.2s'
-        }}
-        onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#555'}
-        onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#333'}
-      >
-        <span style={{ writingMode: 'vertical-rl', fontSize: '13px', letterSpacing: '3px', fontWeight: 'bold' }}>HELP</span>
-      </div>
-
-      {/* 💡 헬프 팝업 모달 */}
-      {isHelpOpen && (
-        <div style={{
-          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, 
-          backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 2000, 
-          display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(3px)'
-        }} onClick={() => setIsHelpOpen(false)}>
-          <div style={{
-            backgroundColor: '#fff', padding: '30px', borderRadius: '12px', 
-            width: '450px', boxShadow: '0 10px 25px rgba(0,0,0,0.2)'
-          }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ marginTop: 0, borderBottom: '2px solid #eee', paddingBottom: '15px' }}>조작법 가이드</h3>
-            
-            <div style={{ maxHeight: '60vh', overflowY: 'auto', paddingRight: '10px' }}>
-                <h4 style={{ color: '#3b82f6', marginBottom: '5px' }}>🎵 통상 (INPUT) 모드</h4>
-                <ul style={{ paddingLeft: '20px', marginTop: 0, fontSize: '14px', color: '#444', lineHeight: '1.6' }}>
-                  <li><b>키보드 Z ~ /</b> : 피아노 건반 (하단)</li>
-                  <li><b>키보드 Q ~ P</b> : 피아노 건반 (상단)</li>
-                  <li><b>- / =</b> : 커서 이동 단위(박자) 변경</li>
-                  <li><b>\</b> : 점음표 토글</li>
-                  <li><b>방향키</b> : 커서 이동</li>
-                  <li><b>Del / Backspace</b> : 커서 위치의 노트 삭제</li>
-                </ul>
-
-                <h4 style={{ color: '#10b981', marginBottom: '5px' }}>🖱️ 선택 (SELECT) 모드 <span style={{fontSize:'12px', color:'#888'}}>( ` 백틱 키로 진입 )</span></h4>
-                <ul style={{ paddingLeft: '20px', marginTop: 0, fontSize: '14px', color: '#444', lineHeight: '1.6' }}>
-                  <li><b>방향키 좌/우</b> : 노트 순차 탐색 (화음 포함)</li>
-                  <li><b>Alt + 위/아래</b> : 반음 조절</li>
-                  <li><b>Shift + 위/아래</b> : 1 옥타브 조절</li>
-                  <li><b>Ctrl + 위/아래</b> : 프렛 유지 줄 이동</li>
-                  <li><b>- / =</b> : 선택된 노트 길이 조절 (리플 편집 - 개발 중)</li>
-                </ul>
-
-                <h4 style={{ color: '#f59e0b', marginBottom: '5px' }}>🎸 특수 기호 (SYMBOL) 모드 <span style={{fontSize:'12px', color:'#888'}}>( ] 키로 진입 )</span></h4>
-                <ul style={{ paddingLeft: '20px', marginTop: 0, fontSize: '14px', color: '#444', lineHeight: '1.6' }}>
-                  <li><b>1 ~ 6</b> : 해당 줄에 뮤트음(X) 삽입 (개발 중)</li>
-                  <li><b>7</b> : 소리 끊음(/) 기호 삽입 (개발 중)</li>
-                </ul>
-                
-                <h4 style={{ color: '#6366f1', marginBottom: '5px' }}>⚙️ 공통 조작</h4>
-                <ul style={{ paddingLeft: '20px', marginTop: 0, fontSize: '14px', color: '#444', lineHeight: '1.6' }}>
-                  <li><b>Ctrl + Z</b> : 실행 취소</li>
-                  <li><b>Ctrl + Shift + Z</b> : 다시 실행</li>
-                </ul>
-            </div>
-
-            <button 
-              onClick={() => setIsHelpOpen(false)}
-              style={{ marginTop: '20px', padding: '10px 16px', width: '100%', backgroundColor: '#3b82f6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}
-            >닫기</button>
+      {/* 💡 상단 헤더 및 툴바 영역 (모드 설명창 내장 및 제목 삭제) */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '20px', flexWrap: 'wrap', gap: '15px' }}>
+        
+        {/* 1. 모드 상태 인디케이터 (화면 고정 해제) */}
+        <div style={{ 
+          backgroundColor: editorMode === 'INPUT' ? '#3b82f6' : (editorMode === 'SELECT' ? '#10b981' : '#f59e0b'), 
+          color: '#fff', padding: '12px 18px', borderRadius: '12px', 
+          boxShadow: '0 4px 15px rgba(0,0,0,0.1)',
+          display: 'flex', flexDirection: 'column', gap: '6px', transition: 'background-color 0.3s',
+          minWidth: '220px'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 'bold', fontSize: '14px' }}>
+            <div style={{ width: '8px', height: '8px', backgroundColor: '#fff', borderRadius: '50%', opacity: 0.9 }} />
+            {editorMode === 'INPUT' && '통상 (INPUT) 모드'}
+            {editorMode === 'SELECT' && '선택 (SELECT) 모드'}
+            {editorMode === 'SYMBOL' && '특수 기호 (SYMBOL) 모드'}
+          </div>
+          <div style={{ fontSize: '11px', opacity: 0.9, lineHeight: '1.4', whiteSpace: 'pre-wrap' }}>
+            {editorMode === 'INPUT' && '클릭 : 커서 스냅 이동\n방향키 ↕ : 박자 조절 (- / =)\n건반(Z~P) : 음표 입력'}
+            {editorMode === 'SELECT' && '방향키 ↔ : 순차 탐색\nAlt/Shift + ↕ : 음정 조절\nCtrl + ↕ : 프렛 유지 줄 이동'}
+            {editorMode === 'SYMBOL' && '숫자 1~6 : 뮤트(X) 입력'}
           </div>
         </div>
-      )}
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: '15px' }}>
-        <h2 style={{ margin: 0 }}>Guitar TAB Editor (Pro)</h2>
-        
-        {/* 💡 데이터 관리 버튼 그룹 */}
-        <div style={{ display: 'flex', gap: '10px' }}>
-          <button 
-            onClick={handleExportJSON}
-            style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}
-          >💾 JSON 내보내기</button>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '10px' }}>
+          {/* 🎵 재생 컨트롤 패널 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', backgroundColor: '#e5e7eb', padding: '6px 16px', borderRadius: '30px', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.05)' }}>
+            <span style={{ fontSize: '14px', fontWeight: 'bold', color: '#555' }}>BPM:</span>
+            <input 
+              type="number" 
+              value={bpm} 
+              onChange={(e) => setBpm(Number(e.target.value))}
+              style={{ width: '50px', padding: '4px', border: '1px solid #ccc', borderRadius: '4px', textAlign: 'center', fontWeight: 'bold' }}
+            />
+            <div style={{ width: '2px', height: '20px', backgroundColor: '#ccc', margin: '0 4px' }} />
+            
+            <button onClick={() => handlePlay(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState === 'PLAYING' ? 0.5 : 1 }} title="처음부터 재생">⏪</button>
+            <button onClick={() => handlePlay(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState === 'PLAYING' ? 0.5 : 1 }} title="커서 위치부터 재생">▶️</button>
+            <button onClick={handleStop} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', color: playbackState === 'PLAYING' ? '#ef4444' : 'inherit' }} title="정지">⏹️</button>
+          </div>
           
-          <label style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>
-            📂 JSON 불러오기
-            <input type="file" accept=".json" style={{ display: 'none' }} onChange={handleImportJSON} />
-          </label>
-          
-          <button 
-            onClick={handleResetScore}
-            style={{ padding: '8px 12px', backgroundColor: '#ef4444', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}
-          >🗑️ 초기화</button>
+          {/* 💾 데이터 관리 버튼 그룹 */}
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button onClick={handleExportJSON} style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>💾 저장</button>
+            <label style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>
+              📂 불러오기 <input type="file" accept=".json" style={{ display: 'none' }} onChange={handleImportJSON} />
+            </label>
+            <button onClick={handleResetScore} style={{ padding: '8px 12px', backgroundColor: '#ef4444', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>🗑️ 초기화</button>
+          </div>
         </div>
       </div>
       
@@ -855,7 +978,32 @@ export default function TabEditor() {
               if (isCursorHere) cursorX = SIDE_PADDING + ((cursor.time - chunk.timeStart) / timeRange) * innerWidth;
 
               return (
-                <svg key={`chunk-${chunk.measureId}-${chunkIdx}`} width={svgWidth} height={HEIGHT} style={{ overflow: 'visible' }}>
+                <svg 
+                  key={`chunk-${chunk.measureId}-${chunkIdx}`} 
+                  width={svgWidth} 
+                  height={HEIGHT} 
+                  style={{ overflow: 'visible', cursor: editorMode === 'INPUT' ? 'pointer' : 'default' }}
+                  onClick={(e) => {
+                    // 💡 INPUT 모드일 때만 클릭 이동 허용
+                    if (editorMode !== 'INPUT') return;
+                    
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const clickX = e.clientX - rect.left;
+                    const innerWidth = svgWidth - (SIDE_PADDING * 2); 
+                    
+                    let timeRatio = (clickX - SIDE_PADDING) / innerWidth;
+                    if (timeRatio < 0) timeRatio = 0;
+                    if (timeRatio > 0.999) timeRatio = 0.999; 
+                    
+                    const exactTime = chunk.timeStart + timeRatio * timeRange;
+                    const step = DURATION_STEPS[durIdx] * (isDotted ? 1.5 : 1);
+                    
+                    // 💡 설정된 박자 단위(step)에 맞춰 내림 연산 후 스냅
+                    const snappedTime = Math.round(Math.floor(exactTime / step) * step * 1000) / 1000;
+                    
+                    setCursor({ mIndex: chunk.mIndex, time: snappedTime });
+                  }}
+                >
                   {[...Array(STRING_COUNT)].map((_, i) => (
                     <line key={i} x1="0" y1={TOP_PADDING + i * STRING_SPACING} x2={svgWidth} y2={TOP_PADDING + i * STRING_SPACING} stroke="#aaa" strokeWidth="1" />
                   ))}
