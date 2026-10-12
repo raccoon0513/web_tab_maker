@@ -344,7 +344,144 @@ export default function TabEditor() {
       });
       return;
     }
+
+    
+    // 💡 [기능 4] - / = : 선택된 복수 노트 길이 동시 조절 및 누적 리플 편집
+    if (e.key === '-' || e.key === '=') {
+      const stepChange = e.key === '=' ? 1 : -1;
+      let newScore = JSON.parse(JSON.stringify(score));
+      
+      // 1. 모든 비트를 1차원 배열로 풀어서 시간순 정렬 (기존 위치 추적용 데이터 포함)
+      let allBeats = [];
+      newScore.forEach((m, mIdx) => {
+        m.beats.forEach(b => {
+          const absTime = Math.round((mIdx * 4 + b.time) * 1000) / 1000;
+          allBeats.push({ ...b, absTime, originalMIndex: mIdx, originalTime: b.time });
+        });
+      });
+      allBeats.sort((a, b) => a.absTime - b.absTime);
+
+      // 2. 선택된 노트들의 절대 시간 수집 (중복 제거)
+      const selectedAbsTimes = new Set();
+      selectedNotes.forEach(sel => {
+        selectedAbsTimes.add(Math.round((sel.mIndex * 4 + sel.time) * 1000) / 1000);
+      });
+
+      if (selectedAbsTimes.size === 0) return;
+
+      let canMove = true;
+      let errorMessage = "";
+      let cumulativeShift = 0; // 💡 복수 노트 변경으로 인한 누적 밀림/당김 시간
+      let shiftedBeats = [];
+
+      // 3. 누적 리플 연산 및 방어 로직
+      for (let i = 0; i < allBeats.length; i++) {
+        let b = allBeats[i];
+        let newAbsTime = Math.round((b.absTime + cumulativeShift) * 1000) / 1000;
+        
+        // 방어 1: 0박자 이전으로 당겨지는 경우
+        if (newAbsTime < 0) {
+          canMove = false;
+          errorMessage = "더 이상 노트를 앞으로 당길 수 없습니다 (0박자 미만).";
+          break;
+        }
+
+        let newDuration = b.duration;
+
+        // 이 비트가 사용자가 선택한 비트라면 박자 변경 및 누적값 갱신
+        if (selectedAbsTimes.has(b.absTime)) {
+          let currentDurIdx = DURATION_STEPS.findIndex(d => d === b.duration || d * 1.5 === b.duration);
+          if (currentDurIdx === -1) currentDurIdx = durIdx; 
+
+          const nextDurIdx = currentDurIdx + stepChange;
+          
+          // 💡 방어 2: 가장 짧은 박자(32분음표 제한 등) 미만으로 내려가면 취소
+          if (nextDurIdx < 0) {
+            canMove = false;
+            errorMessage = "가장 짧은 박자 제한에 도달하여 더 이상 줄일 수 없습니다.";
+            break;
+          }
+          if (nextDurIdx >= DURATION_STEPS.length) {
+            canMove = false;
+            errorMessage = "더 이상 박자를 늘릴 수 없습니다.";
+            break;
+          }
+
+          newDuration = DURATION_STEPS[nextDurIdx] * (isDotted ? 1.5 : 1);
+          const timeDelta = Math.round((newDuration - b.duration) * 1000) / 1000;
+          
+          cumulativeShift = Math.round((cumulativeShift + timeDelta) * 1000) / 1000;
+        }
+        
+        shiftedBeats.push({ ...b, absTime: newAbsTime, duration: newDuration });
+      }
+
+      if (!canMove) {
+        showToast(errorMessage);
+        return;
+      }
+
+      // 4. 악보 재조립 및 화음 병합
+      let maxMIndex = 0;
+      shiftedBeats.forEach(b => maxMIndex = Math.max(maxMIndex, Math.floor(b.absTime / 4)));
+
+      let rebuiltScore = Array.from({ length: Math.max(newScore.length, maxMIndex + 1) }, (_, i) => ({ id: i + 1, beats: [] }));
+
+      shiftedBeats.forEach(b => {
+        const mIdx = Math.floor(b.absTime / 4);
+        const localTime = Math.round((b.absTime % 4) * 1000) / 1000; 
+
+        const existingBeat = rebuiltScore[mIdx].beats.find(eb => eb.time === localTime);
+        if (existingBeat) {
+           existingBeat.notes = { ...existingBeat.notes, ...b.notes };
+           // 💡 한 행에 화음이 부딪혀 겹쳤을 때 "가장 짧은 노트 기준" 반영
+           existingBeat.duration = Math.min(existingBeat.duration, b.duration);
+        } else {
+           rebuiltScore[mIdx].beats.push({
+             time: localTime,
+             duration: b.duration,
+             notes: b.notes,
+             tieId: b.tieId
+           });
+        }
+      });
+
+      // 5. 튕겨나감 없는 복수 선택 영역 좌표 재추적
+      const nextSelectedNotes = selectedNotes.map(sel => {
+        const matchingShiftedBeat = shiftedBeats.find(b => 
+          b.originalMIndex === sel.mIndex && Math.round(b.originalTime * 1000)/1000 === Math.round(sel.time * 1000)/1000
+        );
+        if (matchingShiftedBeat) {
+          const newAbsTime = matchingShiftedBeat.absTime;
+          return { ...sel, mIndex: Math.floor(newAbsTime / 4), time: Math.round((newAbsTime % 4) * 1000) / 1000 };
+        }
+        return sel; 
+      });
+
+      // 6. 상태 일괄 동기화 (커서 위치 및 UI 길이)
+      const sortedNextSelected = [...nextSelectedNotes].sort((a, b) => (a.mIndex * 4 + a.time) - (b.mIndex * 4 + b.time));
+      const nextCursor = { mIndex: sortedNextSelected[0].mIndex, time: sortedNextSelected[0].time };
+
+      let newDurIdx = durIdx;
+      if (sortedNextSelected.length > 0) {
+        const firstSel = sortedNextSelected[0];
+        const firstBeat = rebuiltScore[firstSel.mIndex].beats.find(b => b.time === firstSel.time);
+        if (firstBeat) {
+           const idx = DURATION_STEPS.findIndex(d => d === firstBeat.duration || d * 1.5 === firstBeat.duration);
+           if (idx !== -1) newDurIdx = idx;
+        }
+      }
+
+      setScore(rebuiltScore);
+      setDurIdx(newDurIdx);
+      setSelectedNotes(nextSelectedNotes);
+      setCursor(nextCursor);
+      
+      return;
+    }
   };
+
+  
 
   // 💡 2. 기호 모드 (SYMBOL) 컨트롤러 (임시)
   const handleSymbolModeInput = (e) => {
