@@ -139,6 +139,7 @@ export default function TabEditor() {
   // 💡 재생 관련 상태 (준비 단계)
   const [bpm, setBpm] = useState(120);
   const [playbackState, setPlaybackState] = useState('STOPPED'); // 'STOPPED', 'PLAYING', 'PAUSED'
+  const [isOctaveDown, setIsOctaveDown] = useState(false);
 
   const [activeUIKeys, setActiveUIKeys] = useState(new Set());
   const activeKeysRef = useRef(new Set()); 
@@ -340,9 +341,19 @@ export default function TabEditor() {
       }
 
       let collisionOccurred = false;
+      let outOfRange = false; // 💡 저음 한계 초과 플래그
 
       keysToProcess.forEach(key => {
-        const midi = PIANO_MAP[key];
+        let midi = PIANO_MAP[key];
+        
+        // 💡 옥타브 다운 모드가 켜져 있다면 MIDI 값을 12 낮춤
+        if (isOctaveDown) midi -= 12;
+
+        if (midi < 40) {
+          outOfRange = true; // 스탠다드 튜닝(E2 = 40) 범위 미달
+          return;
+        }
+
         let bestString = null, minFret = 999;
 
         for (let s = 1; s <= 6; s++) {
@@ -364,9 +375,15 @@ export default function TabEditor() {
         } else {
           collisionOccurred = true;
         }
+
+        
       });
 
-      if (collisionOccurred) showToast("입력할 자리가 없습니다!");
+      if (outOfRange) {
+        showToast("스탠다드 튜닝(E2) 범위를 벗어나는 저음입니다.");
+      } else if (collisionOccurred) {
+        showToast("입력할 자리가 없습니다!");
+      }
 
       if (Object.keys(b1.notes).length === 0) cMeasure.beats = cMeasure.beats.filter(b => b !== b1);
       if (tieNeeded && Object.keys(b2.notes).length === 0) nMeasure.beats = nMeasure.beats.filter(b => b !== b2);
@@ -464,100 +481,148 @@ export default function TabEditor() {
       return;
     }
 
-    // 💡 [기능 2] Alt + 상/하: 반음(1프렛) 이동, Shift + 상/하: 1옥타브(12프렛) 이동
-    if ((e.altKey || (e.shiftKey && !e.ctrlKey)) && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+    // 💡 [기능 2] 상/하: 음정 조절 (0프렛 미만 시 자동 줄바꿈, 24프렛 제한 해제)
+    if (!e.ctrlKey && !e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
       const amount = e.shiftKey ? 12 : 1;
       const delta = e.key === 'ArrowUp' ? amount : -amount;
 
       let canMove = true;
-      selectedNotes.forEach(sel => {
-        if (sel.fret + delta < 0 || sel.fret + delta > 24) canMove = false;
+      let errorMessage = "";
+      const plannedMoves = [];
+
+      // 💡 이동 경로 확보를 위해 선택된 노트들을 이동 방향에 따라 정렬 (충돌 방지)
+      const sortedSelected = [...selectedNotes].sort((a, b) => delta < 0 ? b.string - a.string : a.string - b.string);
+
+      const beatState = {}; 
+      
+      sortedSelected.forEach(sel => {
+        const key = `${sel.mIndex}-${sel.time}`;
+        if (!beatState[key]) {
+          const measure = score[sel.mIndex];
+          const beat = measure && measure.beats.find(b => b.time === sel.time);
+          beatState[key] = beat ? { ...beat.notes } : {};
+          // 본인들이 이동할 빈자리를 만들기 위해 현재 상태에서 임시 제외
+          selectedNotes.forEach(s => {
+            if (s.mIndex === sel.mIndex && s.time === sel.time) delete beatState[key][s.string];
+          });
+        }
+
+        if (sel.fret === 'X') {
+          plannedMoves.push(sel);
+          beatState[key][sel.string] = 'X';
+          return;
+        }
+
+        const currentPitch = TUNING[sel.string] + sel.fret;
+        const targetPitch = currentPitch + delta;
+
+        if (targetPitch < 40) {
+          canMove = false; errorMessage = "기타(E2)로 연주할 수 없는 낮은 음입니다."; return;
+        }
+
+        let bestString = null;
+        let newFret = -1;
+        // 💡 하행(delta<0)이면 더 두꺼운 줄(+1)로, 상행이면 얇은 줄(-1) 방향으로 탐색
+        const searchDir = delta < 0 ? 1 : -1; 
+
+        for (let s = sel.string; s >= 1 && s <= 6; s += searchDir) {
+          let f = targetPitch - TUNING[s];
+          // 빈 줄을 찾을 때까지 탐색 (최대 프렛 제한 없음)
+          if (f >= 0 && beatState[key][s] === undefined) {
+            bestString = s;
+            newFret = f;
+            break;
+          }
+        }
+
+        if (bestString === null) {
+          canMove = false; errorMessage = "이동할 수 있는 빈 줄이 없습니다."; return;
+        }
+
+        beatState[key][bestString] = newFret;
+        plannedMoves.push({ ...sel, string: bestString, fret: newFret });
       });
 
-      if (!canMove) {
-        showToast("0~24 프렛 범위를 벗어날 수 없습니다.");
-        return;
-      }
+      if (!canMove) { showToast(errorMessage); return; }
 
-      // 1. 선택 상태 업데이트 (원본 보존)
-      const nextSelectedNotes = selectedNotes.map(sel => ({ ...sel, fret: sel.fret + delta }));
-      setSelectedNotes(nextSelectedNotes);
-
-      // 2. 악보 업데이트
+      setSelectedNotes(plannedMoves);
       setScore(prev => {
         let newScore = JSON.parse(JSON.stringify(prev));
         selectedNotes.forEach(sel => {
-          const measure = newScore[sel.mIndex];
-          const beat = measure && measure.beats.find(b => b.time === sel.time);
-          if (beat && beat.notes[sel.string] !== undefined) {
-            beat.notes[sel.string] = sel.fret + delta;
-          }
+          const beat = newScore[sel.mIndex].beats.find(b => b.time === sel.time);
+          if (beat) delete beat.notes[sel.string];
+        });
+        plannedMoves.forEach(m => {
+          const beat = newScore[m.mIndex].beats.find(b => b.time === m.time);
+          if (beat) beat.notes[m.string] = m.fret;
         });
         return newScore;
       });
       return;
     }
 
-    // 💡 [기능 3] Ctrl + 상/하: 프렛(음높이)은 유지한 채 물리적인 줄(String)만 이동
+    // 💡 [기능 3] Ctrl + 상/하: 프렛 유지 줄 이동 (충돌 시 다음 줄 탐색, 0프렛 미만 시 12프렛 보정)
     if (e.ctrlKey && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
       const stringDelta = e.key === 'ArrowUp' ? -1 : 1; 
+      
       let canMove = true;
       let errorMessage = "";
+      const plannedMoves = [];
 
-      // 1. 사전 검증 (현재 악보 상태 기준)
-      selectedNotes.forEach(sel => {
-        const targetString = sel.string + stringDelta;
-        if (targetString < 1 || targetString > 6) {
-          canMove = false; errorMessage = "기타 줄 범위를 벗어납니다.";
-        } else {
-          const currentPitch = TUNING[sel.string] + sel.fret;
-          const targetFret = currentPitch - TUNING[targetString];
+      const sortedSelected = [...selectedNotes].sort((a, b) => stringDelta > 0 ? b.string - a.string : a.string - b.string);
+      const beatState = {}; 
 
-          if (targetFret < 0 || targetFret > 24) {
-            canMove = false; errorMessage = `해당 음높이를 ${targetString}번 줄에서 연주할 수 없습니다.`;
-          } else {
-            const measure = score[sel.mIndex];
-            const beat = measure && measure.beats.find(b => b.time === sel.time);
-            if (beat && beat.notes[targetString] !== undefined) {
-              const isMovingWithMe = selectedNotes.some(s => s.mIndex === sel.mIndex && s.time === sel.time && s.string === targetString);
-              if (!isMovingWithMe) {
-                canMove = false; errorMessage = "이동하려는 위치에 이미 노트가 존재합니다.";
-              }
-            }
+      sortedSelected.forEach(sel => {
+        const key = `${sel.mIndex}-${sel.time}`;
+        if (!beatState[key]) {
+          const measure = score[sel.mIndex];
+          const beat = measure && measure.beats.find(b => b.time === sel.time);
+          beatState[key] = beat ? { ...beat.notes } : {};
+          selectedNotes.forEach(s => {
+            if (s.mIndex === sel.mIndex && s.time === sel.time) delete beatState[key][s.string];
+          });
+        }
+
+        let bestString = null;
+        // 💡 이동하려는 방향(stringDelta)으로 빈 줄을 찾을 때까지 한 칸씩 전진
+        for (let s = sel.string + stringDelta; s >= 1 && s <= 6; s += stringDelta) {
+          if (beatState[key][s] === undefined) {
+            bestString = s;
+            break;
           }
         }
+
+        if (bestString === null) {
+          canMove = false; errorMessage = "더 이상 이동할 빈 줄이 없습니다."; return;
+        }
+
+        let newFret = sel.fret;
+        if (newFret !== 'X') {
+          const currentPitch = TUNING[sel.string] + sel.fret;
+          newFret = currentPitch - TUNING[bestString];
+          
+          // 💡 0프렛 미만으로 감소하면 0 이상이 될 때까지 12프렛(1옥타브) 단위로 덧셈
+          while (newFret < 0) {
+            newFret += 12;
+          }
+        }
+
+        beatState[key][bestString] = newFret;
+        plannedMoves.push({ ...sel, string: bestString, fret: newFret });
       });
 
-      if (!canMove) {
-        showToast(errorMessage);
-        return;
-      }
+      if (!canMove) { showToast(errorMessage); return; }
 
-      // 2. 새 선택 상태 업데이트 (방향키 이동 순서 꼬임 방지를 위해 순서 그대로 유지)
-      const nextSelectedNotes = selectedNotes.map(sel => {
-        const targetString = sel.string + stringDelta;
-        const currentPitch = TUNING[sel.string] + sel.fret;
-        const targetFret = currentPitch - TUNING[targetString];
-        return { ...sel, string: targetString, fret: targetFret };
-      });
-      setSelectedNotes(nextSelectedNotes);
-
-      // 3. 악보 상태 업데이트 (화음 이동 시 음표가 지워지는 것을 막기 위해 상/하 방향에 맞춰 정렬하여 적용)
+      setSelectedNotes(plannedMoves);
       setScore(prev => {
         let newScore = JSON.parse(JSON.stringify(prev));
-        const sortedSelected = [...selectedNotes].sort((a, b) => e.key === 'ArrowDown' ? b.string - a.string : a.string - b.string);
-        
-        sortedSelected.forEach(sel => {
-          const targetString = sel.string + stringDelta;
-          const currentPitch = TUNING[sel.string] + sel.fret;
-          const targetFret = currentPitch - TUNING[targetString];
-          
-          const measure = newScore[sel.mIndex];
-          const beat = measure && measure.beats.find(b => b.time === sel.time);
-          if (beat) {
-            beat.notes[targetString] = targetFret;
-            delete beat.notes[sel.string];
-          }
+        selectedNotes.forEach(sel => {
+          const beat = newScore[sel.mIndex].beats.find(b => b.time === sel.time);
+          if (beat) delete beat.notes[sel.string];
+        });
+        plannedMoves.forEach(m => {
+          const beat = newScore[m.mIndex].beats.find(b => b.time === m.time);
+          if (beat) beat.notes[m.string] = m.fret;
         });
         return newScore;
       });
@@ -734,7 +799,14 @@ export default function TabEditor() {
 
 
   const handleKeyDown = useCallback((e) => {
+    // 💡 [기능 개선] 입력창(BPM 등)에 글씨를 쓰고 있을 때는 단축키를 완전히 무시
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
+    // 💡 [기능 개선] 화면 스크롤 방지 (스페이스바, 방향키 등)
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+      e.preventDefault();
+    }
+    
     // 2. 모드 전환
     // 💡 2. 모드 전환
     if (e.key === '`') {
@@ -785,7 +857,16 @@ export default function TabEditor() {
 
     // --- 아래부터는 기존 INPUT 모드 (입력 및 커서 이동) ---
     const key = e.key.toLowerCase();
+    
+    // 💡 화면 스크롤 방지
     if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+
+    // 💡 [단축키 추가] Shift 키로 Bass(1옥타브 하향) 토글
+    if (e.key === 'Shift') {
+      e.preventDefault();
+      setIsOctaveDown(prev => !prev);
+      return;
+    }
 
     if (PIANO_MAP[key] !== undefined && !e.repeat) {
       activeKeysRef.current.add(key);
@@ -913,56 +994,118 @@ export default function TabEditor() {
           {toastMsg}
         </div>
       )}
-      
-      {/* 💡 상단 헤더 및 툴바 영역 (모드 설명창 내장 및 제목 삭제) */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '20px', flexWrap: 'wrap', gap: '15px' }}>
-        
-        {/* 1. 모드 상태 인디케이터 (화면 고정 해제) */}
-        <div style={{ 
-          backgroundColor: editorMode === 'INPUT' ? '#3b82f6' : (editorMode === 'SELECT' ? '#10b981' : '#f59e0b'), 
-          color: '#fff', padding: '12px 18px', borderRadius: '12px', 
-          boxShadow: '0 4px 15px rgba(0,0,0,0.1)',
-          display: 'flex', flexDirection: 'column', gap: '6px', transition: 'background-color 0.3s',
-          minWidth: '220px'
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 'bold', fontSize: '14px' }}>
-            <div style={{ width: '8px', height: '8px', backgroundColor: '#fff', borderRadius: '50%', opacity: 0.9 }} />
-            {editorMode === 'INPUT' && '통상 (INPUT) 모드'}
-            {editorMode === 'SELECT' && '선택 (SELECT) 모드'}
-            {editorMode === 'SYMBOL' && '특수 기호 (SYMBOL) 모드'}
-          </div>
-          <div style={{ fontSize: '11px', opacity: 0.9, lineHeight: '1.4', whiteSpace: 'pre-wrap' }}>
-            {editorMode === 'INPUT' && '클릭 : 커서 스냅 이동\n방향키 ↕ : 박자 조절 (- / =)\n건반(Z~P) : 음표 입력'}
-            {editorMode === 'SELECT' && '방향키 ↔ : 순차 탐색\nAlt/Shift + ↕ : 음정 조절\nCtrl + ↕ : 프렛 유지 줄 이동'}
-            {editorMode === 'SYMBOL' && '숫자 1~6 : 뮤트(X) 입력'}
+
+      {/* 💡 왼쪽 엣지 헬프 버튼 (복구됨) */}
+      <div 
+        onClick={() => setIsHelpOpen(true)}
+        style={{
+          position: 'fixed', left: 0, top: '50%', transform: 'translateY(-50%)',
+          width: '28px', height: '100px', backgroundColor: '#333', color: '#fff',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          cursor: 'pointer', borderTopRightRadius: '8px', borderBottomRightRadius: '8px',
+          boxShadow: '2px 0 8px rgba(0,0,0,0.2)', zIndex: 1000, transition: 'background-color 0.2s'
+        }}
+        onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#555'}
+        onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#333'}
+      >
+        <span style={{ writingMode: 'vertical-rl', fontSize: '13px', letterSpacing: '3px', fontWeight: 'bold' }}>HELP</span>
+      </div>
+
+      {/* 💡 헬프 팝업 모달 (최신 단축키 반영) */}
+      {isHelpOpen && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, 
+          backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 2000, 
+          display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(3px)'
+        }} onClick={() => setIsHelpOpen(false)}>
+          <div style={{
+            backgroundColor: '#fff', padding: '30px', borderRadius: '12px', 
+            width: '450px', boxShadow: '0 10px 25px rgba(0,0,0,0.2)'
+          }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0, borderBottom: '2px solid #eee', paddingBottom: '15px' }}>조작법 가이드</h3>
+            
+            <div style={{ maxHeight: '60vh', overflowY: 'auto', paddingRight: '10px' }}>
+                <h4 style={{ color: '#3b82f6', marginBottom: '5px' }}>🎵 통상 (INPUT) 모드</h4>
+                <ul style={{ paddingLeft: '20px', marginTop: 0, fontSize: '14px', color: '#444', lineHeight: '1.6' }}>
+                  <li><b>키보드 Z ~ /</b> : 피아노 건반 (하단)</li>
+                  <li><b>키보드 Q ~ P</b> : 피아노 건반 (상단)</li>
+                  <li><b>- / +</b> : 커서 이동 단위(박자) 변경</li>
+                  <li><b>\ (백슬래쉬)</b> : 점음표 토글</li>
+                  <li><b>Shift</b> : 1옥타브 하향 입력 토글 (Bass)</li>
+                  <li><b>방향키</b> : 커서 이동 (마우스 클릭 스냅 지원)</li>
+                  <li><b>Del / Backspace</b> : 커서 위치의 노트 삭제</li>
+                </ul>
+
+                <h4 style={{ color: '#10b981', marginBottom: '5px' }}>🖱️ 선택 (SELECT) 모드 <span style={{fontSize:'12px', color:'#888'}}>( ` 백틱 키로 진입 )</span></h4>
+                <ul style={{ paddingLeft: '20px', marginTop: 0, fontSize: '14px', color: '#444', lineHeight: '1.6' }}>
+                  <li><b>방향키 좌/우</b> : 노트 순차 탐색 (화음 포함)</li>
+                  <li><b>방향키 위/아래</b> : 음정 조절 (자동 줄바꿈 적용)</li>
+                  <li><b>Shift + 위/아래</b> : 1 옥타브 조절</li>
+                  <li><b>Ctrl + 위/아래</b> : 프렛 유지 줄 이동 (옥타브 보정)</li>
+                  <li><b>- / +</b> : 선택된 노트 길이 조절 (리플 편집)</li>
+                </ul>
+
+                <h4 style={{ color: '#f59e0b', marginBottom: '5px' }}>🎸 특수 기호 (SYMBOL) 모드 <span style={{fontSize:'12px', color:'#888'}}>( ] 키로 진입 )</span></h4>
+                <ul style={{ paddingLeft: '20px', marginTop: 0, fontSize: '14px', color: '#444', lineHeight: '1.6' }}>
+                  <li><b>1 ~ 6</b> : 해당 줄에 뮤트음(X) 삽입</li>
+                </ul>
+            </div>
+
+            <button 
+              onClick={() => setIsHelpOpen(false)}
+              style={{ marginTop: '20px', padding: '10px 16px', width: '100%', backgroundColor: '#3b82f6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}
+            >닫기</button>
           </div>
         </div>
+      )}
+      
+      {/* 💡 퀵 가이드 및 모드 상태 인디케이터 (스크롤해도 우측 상단에 고정) */}
+      <div style={{ 
+        position: 'fixed', top: '20px', right: '20px', 
+        backgroundColor: editorMode === 'INPUT' ? '#3b82f6' : (editorMode === 'SELECT' ? '#10b981' : '#f59e0b'), 
+        color: '#fff', padding: '14px 20px', borderRadius: '12px', 
+        boxShadow: '0 4px 15px rgba(0,0,0,0.2)', zIndex: 1000,
+        display: 'flex', flexDirection: 'column', gap: '8px', transition: 'background-color 0.3s'
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 'bold', fontSize: '15px' }}>
+          <div style={{ width: '10px', height: '10px', backgroundColor: '#fff', borderRadius: '50%', opacity: 0.9 }} />
+          {editorMode === 'INPUT' && '통상 (INPUT) 모드'}
+          {editorMode === 'SELECT' && '선택 (SELECT) 모드'}
+          {editorMode === 'SYMBOL' && '특수 기호 (SYMBOL) 모드'}
+        </div>
+        <div style={{ fontSize: '12px', opacity: 0.9, lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>
+          {editorMode === 'INPUT' && '클릭 : 커서 스냅 이동\nShift : 1옥타브 하향 토글(Bass)\n방향키 ↕ : 박자 조절\n건반(Z~P) : 음표 입력'}
+          {editorMode === 'SELECT' && '방향키 ↔ : 순차 탐색\n방향키 ↕ : 음정 조절 (자동 줄바꿈)\nCtrl + ↕ : 줄 이동 (+옥타브 보정)\n- / = : 리플 편집'}
+          {editorMode === 'SYMBOL' && '숫자 1~6 : 뮤트(X) 입력'}
+        </div>
+      </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '10px' }}>
-          {/* 🎵 재생 컨트롤 패널 */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', backgroundColor: '#e5e7eb', padding: '6px 16px', borderRadius: '30px', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.05)' }}>
-            <span style={{ fontSize: '14px', fontWeight: 'bold', color: '#555' }}>BPM:</span>
-            <input 
-              type="number" 
-              value={bpm} 
-              onChange={(e) => setBpm(Number(e.target.value))}
-              style={{ width: '50px', padding: '4px', border: '1px solid #ccc', borderRadius: '4px', textAlign: 'center', fontWeight: 'bold' }}
-            />
-            <div style={{ width: '2px', height: '20px', backgroundColor: '#ccc', margin: '0 4px' }} />
-            
-            <button onClick={() => handlePlay(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState === 'PLAYING' ? 0.5 : 1 }} title="처음부터 재생">⏪</button>
-            <button onClick={() => handlePlay(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState === 'PLAYING' ? 0.5 : 1 }} title="커서 위치부터 재생">▶️</button>
-            <button onClick={handleStop} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', color: playbackState === 'PLAYING' ? '#ef4444' : 'inherit' }} title="정지">⏹️</button>
-          </div>
+      {/* 💡 상단 툴바 영역 (제목 삭제 및 좌측 정렬) */}
+      <div style={{ display: 'flex', justifyContent: 'flex-start', alignItems: 'center', marginBottom: '20px', gap: '15px' }}>
+        
+        {/* 🎵 재생 컨트롤 패널 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', backgroundColor: '#e5e7eb', padding: '6px 16px', borderRadius: '30px', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.05)' }}>
+          <span style={{ fontSize: '14px', fontWeight: 'bold', color: '#555' }}>BPM:</span>
+          <input 
+            type="number" 
+            value={bpm} 
+            onChange={(e) => setBpm(Number(e.target.value))}
+            style={{ width: '50px', padding: '4px', border: '1px solid #ccc', borderRadius: '4px', textAlign: 'center', fontWeight: 'bold' }}
+          />
+          <div style={{ width: '2px', height: '20px', backgroundColor: '#ccc', margin: '0 4px' }} />
           
-          {/* 💾 데이터 관리 버튼 그룹 */}
-          <div style={{ display: 'flex', gap: '8px' }}>
-            <button onClick={handleExportJSON} style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>💾 저장</button>
-            <label style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>
-              📂 불러오기 <input type="file" accept=".json" style={{ display: 'none' }} onChange={handleImportJSON} />
-            </label>
-            <button onClick={handleResetScore} style={{ padding: '8px 12px', backgroundColor: '#ef4444', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>🗑️ 초기화</button>
-          </div>
+          <button onClick={() => handlePlay(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState === 'PLAYING' ? 0.5 : 1 }} title="처음부터 재생">⏪</button>
+          <button onClick={() => handlePlay(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState === 'PLAYING' ? 0.5 : 1 }} title="커서 위치부터 재생">▶️</button>
+          <button onClick={handleStop} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', color: playbackState === 'PLAYING' ? '#ef4444' : 'inherit' }} title="정지">⏹️</button>
+        </div>
+        
+        {/* 💾 데이터 관리 버튼 그룹 */}
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button onClick={handleExportJSON} style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>💾 저장</button>
+          <label style={{ padding: '8px 12px', backgroundColor: '#4b5563', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>
+            📂 불러오기 <input type="file" accept=".json" style={{ display: 'none' }} onChange={handleImportJSON} />
+          </label>
+          <button onClick={handleResetScore} style={{ padding: '8px 12px', backgroundColor: '#ef4444', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' }}>🗑️ 초기화</button>
         </div>
       </div>
       
@@ -1073,11 +1216,13 @@ export default function TabEditor() {
         ))}
       </div>
 
-      <div style={{ position: 'fixed', bottom: 0, left: 0, right: 0, backgroundColor: '#2b2b2b', padding: '15px 0', display: 'flex', flexDirection: 'column', alignItems: 'center', borderTop: '4px solid #000', zIndex: 100 }}>
+      <div style={{ position: 'fixed', bottom: 0, left: 0, right: 0, backgroundColor: '#2b2b2b', padding: '8px 0', display: 'flex', flexDirection: 'column', alignItems: 'center', borderTop: '4px solid #000', zIndex: 100 }}>
         
-        <div style={{ display: 'flex', gap: '20px', color: '#aaa', fontSize: '13px', marginBottom: '15px', backgroundColor: '#1a1a1a', padding: '8px 20px', borderRadius: '20px' }}>
-          <span><kbd style={{color:'#fff'}}>-</kbd> <kbd style={{color:'#fff'}}>=</kbd> 이동: <b>{DURATION_STEPS[durIdx]}박</b></span>
+        {/* 💡 상태 표시줄 (Shift Bass 상태 추가됨) */}
+        <div style={{ display: 'flex', gap: '20px', color: '#aaa', fontSize: '13px', marginBottom: '8px', backgroundColor: '#1a1a1a', padding: '8px 20px', borderRadius: '20px' }}>
+          <span><kbd style={{color:'#fff'}}>-</kbd> <kbd style={{color:'#fff'}}>+</kbd> 이동: <b>{DURATION_STEPS[durIdx]}박</b></span>
           <span><kbd style={{color:'#fff'}}>\</kbd> 점음표: <b style={{color: isDotted ? '#3b82f6' : '#aaa'}}>{isDotted ? 'ON' : 'OFF'}</b></span>
+          <span><kbd style={{color:'#fff'}}>Shift</kbd> Bass: <b style={{color: isOctaveDown ? '#3b82f6' : '#aaa'}}>{isOctaveDown ? 'ON' : 'OFF'}</b></span>
           <span><kbd style={{color:'#fff'}}>←</kbd> <kbd style={{color:'#fff'}}>→</kbd> 커서</span>
           <span><kbd style={{color:'#fff'}}>Del</kbd> 삭제</span>
         </div>
