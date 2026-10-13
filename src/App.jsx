@@ -17,6 +17,7 @@ const STRING_COUNT = 6;
 const STRING_SPACING = 20;
 const TOP_PADDING = 30;
 const HEIGHT = TOP_PADDING + STRING_SPACING * 5 + 30; 
+const METRONOME_GAIN = 0.8 // original 0.4
 
 const TUNING = { 1: 64, 2: 59, 3: 55, 4: 50, 5: 45, 6: 40 };
 
@@ -80,6 +81,25 @@ const playPercussiveMute = (startTime) => {
   noise.start(startTime);
 };
 
+// 💡 메트로놈 띡/딱 사운드 합성 (첫 박자는 높은음 Accent)
+const playMetronomeClick = (time, isAccent) => {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  
+  osc.type = 'sine';
+  osc.frequency.value = isAccent ? 1200 : 800; 
+  
+  gain.gain.setValueAtTime(0, time);
+  gain.gain.linearRampToValueAtTime(METRONOME_GAIN, time + 0.005); //original = 0.4
+  gain.gain.exponentialRampToValueAtTime(0.001, time + 0.05);
+  
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start(time);
+  osc.stop(time + 0.06);
+};
+
 // 키보드 매핑
 const PIANO_MAP = {
   'z' : 48, 's' : 49, 'x' : 50, 'd' : 51, 
@@ -141,6 +161,12 @@ export default function TabEditor() {
   const [playbackState, setPlaybackState] = useState('STOPPED'); // 'STOPPED', 'PLAYING', 'PAUSED'
   const [isOctaveDown, setIsOctaveDown] = useState(false);
 
+  const prePlaybackCursorRef = useRef(null); // 💡 재생 전 커서 위치 기억용 
+  const [isMetronome, setIsMetronome] = useState(false);
+  const recordingStartTimeRef = useRef(null); // 실제 녹음 시작 시간(카운트인 종료 시점)
+  const recordingStartBeatRef = useRef(null); // 녹음을 시작한 절대 박자 위치
+  const lastRecordPressTimeRef = useRef(null); // 녹음 중 건반을 누른 정확한 퀀타이즈 시점
+
   const [activeUIKeys, setActiveUIKeys] = useState(new Set());
   const activeKeysRef = useRef(new Set()); 
   const chordAccumulatorRef = useRef(new Set()); 
@@ -194,7 +220,7 @@ export default function TabEditor() {
     setTimeout(() => setToastMsg(null), 2000);
   };
 
-  // 💡 정지 로직: 예약된 오디오와 시각적 커서 타이머 모두 초기화
+  // 💡 정지 로직: 예약된 오디오 취소 및 커서 원래 위치로 복귀
   const handleStop = useCallback(() => {
     if (audioCtx) {
       audioCtx.close(); 
@@ -203,48 +229,94 @@ export default function TabEditor() {
     playbackTimers.forEach(clearTimeout);
     playbackTimers = [];
     setPlaybackState('STOPPED');
+
+    if (prePlaybackCursorRef.current) {
+      setCursor(prePlaybackCursorRef.current);
+      prePlaybackCursorRef.current = null;
+    }
   }, []);
 
-  // 💡 재생 로직: 악보를 읽어 시간순으로 오디오 스케줄링
-  const handlePlay = useCallback((fromCursor = false) => {
-    handleStop(); // 기존 재생 중이던 소리 강제 종료
+  // 💡 재생 및 녹음 로직
+  const handlePlay = useCallback((playMode = 'ALL') => {
+    const cursorToSave = prePlaybackCursorRef.current || cursor;
+    handleStop(); 
+    prePlaybackCursorRef.current = cursorToSave;
+
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    setPlaybackState('PLAYING');
-    setSelectedNotes([]); // 재생 중 선택 박스 방해 방지
+    const isRecording = playMode === 'RECORD';
+    setPlaybackState(isRecording ? 'RECORDING' : 'PLAYING');
+    setSelectedNotes([]); 
 
     const secondsPerBeat = 60 / bpm;
-    const startAbsoluteTime = fromCursor ? (cursor.mIndex * 4 + cursor.time) : 0; 
-    const ctxStartTime = audioCtx.currentTime + 0.1; 
+    let startAbsoluteTime = 0;
 
-    let maxEndTime = 0;
+    // 💡 요구사항: MEASURE 모드와 RECORD 모드는 무조건 현재 마디의 처음부터!
+    if (playMode === 'CURSOR') {
+      startAbsoluteTime = cursorToSave.mIndex * 4 + cursorToSave.time;
+    } else if (playMode === 'MEASURE' || isRecording) {
+      startAbsoluteTime = cursorToSave.mIndex * 4; 
+    }
 
+    let ctxStartTime = audioCtx.currentTime + 0.1; 
+
+    // 💡 카운트인: 녹음 모드일 때 가상의 4박자 대기 시간
+    if (isRecording) {
+      for (let i = 0; i < 4; i++) {
+        playMetronomeClick(ctxStartTime + (i * secondsPerBeat), i === 0);
+      }
+      ctxStartTime += 4 * secondsPerBeat;
+      recordingStartTimeRef.current = ctxStartTime;
+      recordingStartBeatRef.current = startAbsoluteTime;
+    }
+
+    let maxEndTime = ctxStartTime;
+    let hasNotesToPlay = false;
+    const step = DURATION_STEPS[durIdx] * (isDotted ? 1.5 : 1);
+
+    // 💡 메트로놈 & 빈 그리드 스케줄링 (녹음 시 음표가 없어도 커서가 전진)
+    if (isMetronome || isRecording) {
+      const maxBeatsToSchedule = 800; // 💡 넉넉하게 200마디까지 안 끊기도록 한도 증가
+      for (let i = 0; i < maxBeatsToSchedule; i++) {
+        const tickTime = ctxStartTime + (i * secondsPerBeat);
+        
+        // 💡 수정됨: 녹음 중(isRecording)일 때는 무조건 메트로놈 계속 재생
+        if (isMetronome || isRecording) {
+          playMetronomeClick(tickTime, i % 4 === 0);
+        }
+        
+        if (isRecording && (i % step === 0 || i === 0)) {
+           const currentAbs = startAbsoluteTime + i;
+           const timer = setTimeout(() => {
+             setCursor({ mIndex: Math.floor(currentAbs / 4), time: currentAbs % 4 });
+           }, (tickTime - audioCtx.currentTime) * 1000);
+           playbackTimers.push(timer);
+           maxEndTime = Math.max(maxEndTime, tickTime);
+        }
+      }
+    }
+
+    // 💡 기존 악보 오디오 스케줄링
     score.forEach((measure, mIndex) => {
       measure.beats.forEach(beat => {
         const absTime = mIndex * 4 + beat.time;
-        
         if (absTime >= startAbsoluteTime) {
+          hasNotesToPlay = true;
           const timeOffset = absTime - startAbsoluteTime; 
           const startTimeInSec = ctxStartTime + (timeOffset * secondsPerBeat);
           const durationInSec = beat.duration * secondsPerBeat;
 
-          // 1. 화음 내의 모든 노트를 동시에 스케줄링
           Object.entries(beat.notes).forEach(([string, fret]) => {
-            if (fret === 'X') {
-              // 💡 'X'일 때는 음표 대신 퍼커시브 챱챱 사운드 재생
-              playPercussiveMute(startTimeInSec);
-            } else {
-              // 일반 숫자 프렛일 때는 기존 기타 사운드 재생
-              const strNum = parseInt(string, 10);
-              const midi = TUNING[strNum] + fret;
-              playTone(midi, startTimeInSec, durationInSec);
-            }
+            if (fret === 'X') playPercussiveMute(startTimeInSec);
+            else playTone(TUNING[parseInt(string, 10)] + fret, startTimeInSec, durationInSec);
           });
 
-          // 2. 소리가 나는 타이밍에 맞춰 파란색 진행 바(Cursor) 이동
-          const timer = setTimeout(() => {
-            setCursor({ mIndex: measure.id - 1, time: beat.time });
-          }, (startTimeInSec - audioCtx.currentTime) * 1000);
-          playbackTimers.push(timer);
+          // 일반 재생 시에만 오디오 기준으로 커서 이동
+          if (!isRecording) {
+            const timer = setTimeout(() => {
+              setCursor({ mIndex: measure.id - 1, time: beat.time });
+            }, (startTimeInSec - audioCtx.currentTime) * 1000);
+            playbackTimers.push(timer);
+          }
 
           if (startTimeInSec + durationInSec > maxEndTime) {
             maxEndTime = startTimeInSec + durationInSec;
@@ -253,12 +325,17 @@ export default function TabEditor() {
       });
     });
 
+    if (!hasNotesToPlay && !isRecording) {
+      handleStop(); return;
+    }
+
     const endTimer = setTimeout(() => {
-      setPlaybackState('STOPPED');
-    }, (maxEndTime - audioCtx.currentTime) * 1000);
+      handleStop();
+    }, (maxEndTime - audioCtx.currentTime) * 1000 + 150);
     playbackTimers.push(endTimer);
 
-  }, [score, bpm, cursor, handleStop]);
+  }, [score, bpm, cursor, handleStop, isMetronome, durIdx, isDotted]);
+
   const layout = useMemo(() => {
     const lines = [];
     let currentLineChunks = [];
@@ -296,12 +373,16 @@ export default function TabEditor() {
     return lines;
   }, [score]);
 
-  const insertChord = (keysToProcess) => {
+  // 💡 통상 입력과 실시간 녹음을 모두 처리하는 범용 insertChord
+  const insertChord = (keysToProcess, overrideTime = null) => {
     const targetDur = DURATION_STEPS[durIdx] * (isDotted ? 1.5 : 1);
     
-    // 💡 1. 입력 후 이동할 다음 커서 위치를 먼저 계산 (여러 마디를 넘어가도 안전하게 처리)
-    let nextTime = cursor.time + targetDur;
-    let nextMIndex = cursor.mIndex;
+    // overrideTime이 주어지면(녹음 중) 퀀타이즈된 위치 사용, 아니면 현재 커서 사용
+    const baseMIndex = overrideTime ? overrideTime.mIndex : cursor.mIndex;
+    const baseTime = overrideTime ? overrideTime.time : cursor.time;
+
+    let nextTime = baseTime + targetDur;
+    let nextMIndex = baseMIndex;
     while (nextTime >= 4) { 
       nextMIndex += 1; 
       nextTime -= 4; 
@@ -310,29 +391,28 @@ export default function TabEditor() {
     setScore(prev => {
       let newScore = JSON.parse(JSON.stringify(prev));
       
-      const remainingTime = 4 - cursor.time;
+      const remainingTime = 4 - baseTime;
       const tieNeeded = targetDur > remainingTime;
 
-      // 💡 2. 현재 마디, 붙임줄 목적지 마디, 그리고 이동할 다음 빈 마디까지 넉넉하게 미리 생성
-      const maxNeededIndex = Math.max(cursor.mIndex + (tieNeeded ? 1 : 0), nextMIndex);
+      const maxNeededIndex = Math.max(baseMIndex + (tieNeeded ? 1 : 0), nextMIndex);
       while (newScore.length <= maxNeededIndex) {
         newScore.push({ id: newScore.length + 1, beats: [] });
       }
       
-      let cMeasure = newScore[cursor.mIndex];
+      let cMeasure = newScore[baseMIndex];
       const durPart1 = tieNeeded ? remainingTime : targetDur;
       const durPart2 = tieNeeded ? targetDur - remainingTime : 0;
       const tieId = tieNeeded ? Date.now().toString() : null;
 
-      let b1 = cMeasure.beats.find(b => b.time === cursor.time);
+      let b1 = cMeasure.beats.find(b => b.time === baseTime);
       if (!b1) {
-        b1 = { time: cursor.time, duration: durPart1, notes: {}, tieId };
+        b1 = { time: baseTime, duration: durPart1, notes: {}, tieId };
         cMeasure.beats.push(b1);
       }
 
       let nMeasure = null, b2 = null;
       if (tieNeeded) {
-        nMeasure = newScore[cursor.mIndex + 1];
+        nMeasure = newScore[baseMIndex + 1];
         b2 = nMeasure.beats.find(b => b.time === 0);
         if (!b2) {
           b2 = { time: 0, duration: durPart2, notes: {}, tieId };
@@ -341,30 +421,25 @@ export default function TabEditor() {
       }
 
       let collisionOccurred = false;
-      let outOfRange = false; // 💡 저음 한계 초과 플래그
+      let outOfRange = false;
 
       keysToProcess.forEach(key => {
         let midi = PIANO_MAP[key];
-        
-        // 💡 옥타브 다운 모드가 켜져 있다면 MIDI 값을 12 낮춤
         if (isOctaveDown) midi -= 12;
 
         if (midi < 40) {
-          outOfRange = true; // 스탠다드 튜닝(E2 = 40) 범위 미달
+          outOfRange = true; 
           return;
         }
 
         let bestString = null, minFret = 999;
-
         for (let s = 1; s <= 6; s++) {
           const fret = midi - TUNING[s];
           if (fret >= 0 && fret <= 24) {
             const b1Clear = b1.notes[s] === undefined;
             const b2Clear = tieNeeded ? b2.notes[s] === undefined : true;
-            
             if (b1Clear && b2Clear && fret < minFret) {
-              minFret = fret;
-              bestString = s;
+              minFret = fret; bestString = s;
             }
           }
         }
@@ -375,15 +450,10 @@ export default function TabEditor() {
         } else {
           collisionOccurred = true;
         }
-
-        
       });
 
-      if (outOfRange) {
-        showToast("스탠다드 튜닝(E2) 범위를 벗어나는 저음입니다.");
-      } else if (collisionOccurred) {
-        showToast("입력할 자리가 없습니다!");
-      }
+      if (outOfRange) showToast("스탠다드 튜닝(E2) 범위를 벗어나는 저음입니다.");
+      else if (collisionOccurred) showToast("입력할 자리가 없습니다!");
 
       if (Object.keys(b1.notes).length === 0) cMeasure.beats = cMeasure.beats.filter(b => b !== b1);
       if (tieNeeded && Object.keys(b2.notes).length === 0) nMeasure.beats = nMeasure.beats.filter(b => b !== b2);
@@ -391,8 +461,10 @@ export default function TabEditor() {
       return newScore;
     });
 
-    // 💡 3. 계산해둔 다음 위치로 커서 이동
-    setCursor({ mIndex: nextMIndex, time: nextTime });
+    // 녹음 모드가 아닐 때만 커서를 물리적으로 전진시킴
+    if (!overrideTime) {
+      setCursor({ mIndex: nextMIndex, time: nextTime });
+    }
   };
 
   const handleSelectModeInput = (e) => {
@@ -545,6 +617,18 @@ export default function TabEditor() {
 
       if (!canMove) { showToast(errorMessage); return; }
 
+      // 💡 [피드백 추가] 이동이 확정된 노트들 즉시 재생
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const now = audioCtx.currentTime;
+      plannedMoves.forEach(m => {
+        if (m.fret === 'X') {
+          playPercussiveMute(now);
+        } else {
+          const midi = TUNING[m.string] + m.fret;
+          playTone(midi, now, 0.4);
+        }
+      });
+
       setSelectedNotes(plannedMoves);
       setScore(prev => {
         let newScore = JSON.parse(JSON.stringify(prev));
@@ -612,6 +696,17 @@ export default function TabEditor() {
       });
 
       if (!canMove) { showToast(errorMessage); return; }
+
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const now = audioCtx.currentTime;
+      plannedMoves.forEach(m => {
+        if (m.fret === 'X') {
+          playPercussiveMute(now);
+        } else {
+          const midi = TUNING[m.string] + m.fret;
+          playTone(midi, now, 0.4);
+        }
+      });
 
       setSelectedNotes(plannedMoves);
       setScore(prev => {
@@ -797,15 +892,21 @@ export default function TabEditor() {
     }
   };
 
-
   const handleKeyDown = useCallback((e) => {
-    // 💡 [기능 개선] 입력창(BPM 등)에 글씨를 쓰고 있을 때는 단축키를 완전히 무시
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
-    // 💡 [기능 개선] 화면 스크롤 방지 (스페이스바, 방향키 등)
-    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+    // 💡 스페이스바: 재생 / 녹음 / 정지 토글
+    if (e.key === ' ') {
       e.preventDefault();
+      if (playbackState === 'PLAYING' || playbackState === 'RECORDING') {
+        handleStop();
+      } else {
+        handlePlay('MEASURE');
+      }
+      return;
     }
+
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) e.preventDefault();
     
     // 2. 모드 전환
     // 💡 2. 모드 전환
@@ -869,9 +970,41 @@ export default function TabEditor() {
     }
 
     if (PIANO_MAP[key] !== undefined && !e.repeat) {
+      // 💡 녹음 모드일 때 첫 건반을 누른 순간의 "정확한 시간"을 측정하여 퀀타이즈(스냅)
+      if (playbackState === 'RECORDING' && chordAccumulatorRef.current.size === 0) {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const now = audioCtx.currentTime;
+        const elapsedSec = now - recordingStartTimeRef.current;
+        
+        let elapsedBeats = 0;
+        if (elapsedSec > 0) { // 카운트인 종료 이후
+          elapsedBeats = elapsedSec / (60 / bpm);
+        }
+        
+        const currentAbsBeat = recordingStartBeatRef.current + elapsedBeats;
+        const step = DURATION_STEPS[durIdx] * (isDotted ? 1.5 : 1);
+        
+        // 박자 그리드에 맞게 가장 가까운 곳으로 반올림
+        const quantizedAbsBeat = Math.round(currentAbsBeat / step) * step;
+        
+        lastRecordPressTimeRef.current = {
+          mIndex: Math.floor(quantizedAbsBeat / 4),
+          time: Math.round((quantizedAbsBeat % 4) * 1000) / 1000
+        };
+      }
+
       activeKeysRef.current.add(key);
       chordAccumulatorRef.current.add(key);
       setActiveUIKeys(new Set(activeKeysRef.current));
+
+      // 💡 [피드백] 키를 누르는 즉시 즉각적인 사운드 재생
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      let midi = PIANO_MAP[key];
+      if (isOctaveDown) midi -= 12;
+      
+      if (midi >= 40) { 
+        playTone(midi, audioCtx.currentTime, 0.4); 
+      }
       return;
     }
 
@@ -927,21 +1060,28 @@ export default function TabEditor() {
       else if (nextTime < 0) { nextTime = 0; }
       setCursor({ mIndex: nextMIndex, time: nextTime });
     }
-  }, [score, cursor, durIdx, isDotted, editorMode, selectedNotes]);
+  }, [score, cursor, durIdx, isDotted, editorMode, selectedNotes, playbackState, handlePlay, handleStop]);
 
   const handleKeyUp = useCallback((e) => {
-    // (기존 handleKeyUp 코드 그대로 유지)
     const key = e.key.toLowerCase();
     if (PIANO_MAP[key] !== undefined) {
       activeKeysRef.current.delete(key);
       setActiveUIKeys(new Set(activeKeysRef.current));
 
       if (activeKeysRef.current.size === 0 && chordAccumulatorRef.current.size > 0) {
-        insertChord(new Set(chordAccumulatorRef.current));
+        const keysToProcess = new Set(chordAccumulatorRef.current);
         chordAccumulatorRef.current.clear(); 
+        
+        // 💡 녹음 중일 땐 퀀타이즈된 시간으로 전달, 아닐 땐 일반 입력
+        if (playbackState === 'RECORDING' && lastRecordPressTimeRef.current) {
+           insertChord(keysToProcess, lastRecordPressTimeRef.current);
+           lastRecordPressTimeRef.current = null;
+        } else {
+           insertChord(keysToProcess);
+        }
       }
     }
-  }, [cursor, durIdx, isDotted]);
+  }, [cursor, durIdx, isDotted, playbackState]); // 💡 의존성 배열 업데이트
 
   // 💡 4. 이벤트 리스너 등록 (깔끔하게 분리됨)
   useEffect(() => {
@@ -1059,7 +1199,7 @@ export default function TabEditor() {
         </div>
       )}
       
-      {/* 💡 퀵 가이드 및 모드 상태 인디케이터 (스크롤해도 우측 상단에 고정) */}
+      {/* 💡 퀵 가이드 및 모드 상태 인디케이터 */}
       <div style={{ 
         position: 'fixed', top: '20px', right: '20px', 
         backgroundColor: editorMode === 'INPUT' ? '#3b82f6' : (editorMode === 'SELECT' ? '#10b981' : '#f59e0b'), 
@@ -1074,18 +1214,26 @@ export default function TabEditor() {
           {editorMode === 'SYMBOL' && '특수 기호 (SYMBOL) 모드'}
         </div>
         <div style={{ fontSize: '12px', opacity: 0.9, lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>
-          {editorMode === 'INPUT' && '클릭 : 커서 스냅 이동\nShift : 1옥타브 하향 토글(Bass)\n방향키 ↕ : 박자 조절\n건반(Z~P) : 음표 입력'}
-          {editorMode === 'SELECT' && '방향키 ↔ : 순차 탐색\n방향키 ↕ : 음정 조절 (자동 줄바꿈)\nCtrl + ↕ : 줄 이동 (+옥타브 보정)\n- / = : 리플 편집'}
-          {editorMode === 'SYMBOL' && '숫자 1~6 : 뮤트(X) 입력'}
+          {editorMode === 'INPUT' && '클릭 : 커서 스냅 이동\nSpace : 마디 재생/정지\nShift : Bass 토글\n건반(Z~P) : 음표 입력'}
+          {editorMode === 'SELECT' && 'Space : 마디 재생/정지\n방향키 ↕ : 음정 (자동 줄바꿈)\nCtrl+↕ : 줄 이동 (옥타브 보정)\n- / = : 리플 편집'}
+          {editorMode === 'SYMBOL' && 'Space : 마디 재생/정지\n숫자 1~6 : 뮤트(X) 입력'}
         </div>
       </div>
 
-      {/* 💡 상단 툴바 영역 (제목 삭제 및 좌측 정렬) */}
+      {/* 💡 상단 툴바 영역 */}
       <div style={{ display: 'flex', justifyContent: 'flex-start', alignItems: 'center', marginBottom: '20px', gap: '15px' }}>
         
         {/* 🎵 재생 컨트롤 패널 */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', backgroundColor: '#e5e7eb', padding: '6px 16px', borderRadius: '30px', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.05)' }}>
-          <span style={{ fontSize: '14px', fontWeight: 'bold', color: '#555' }}>BPM:</span>
+          
+          {/* ⏱️ 메트로놈 토글 버튼 */}
+          <button 
+            onClick={() => setIsMetronome(!isMetronome)}
+            style={{ backgroundColor: isMetronome ? '#3b82f6' : 'transparent', color: isMetronome ? '#fff' : '#555', border: isMetronome ? 'none' : '1px solid #ccc', padding: '4px 8px', borderRadius: '8px', fontSize: '14px', cursor: 'pointer', transition: '0.2s' }}
+            title="메트로놈 켜기/끄기"
+          >⏱️</button>
+
+          <span style={{ fontSize: '14px', fontWeight: 'bold', color: '#555', marginLeft: '5px' }}>BPM:</span>
           <input 
             type="number" 
             value={bpm} 
@@ -1094,9 +1242,18 @@ export default function TabEditor() {
           />
           <div style={{ width: '2px', height: '20px', backgroundColor: '#ccc', margin: '0 4px' }} />
           
-          <button onClick={() => handlePlay(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState === 'PLAYING' ? 0.5 : 1 }} title="처음부터 재생">⏪</button>
-          <button onClick={() => handlePlay(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState === 'PLAYING' ? 0.5 : 1 }} title="커서 위치부터 재생">▶️</button>
-          <button onClick={handleStop} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', color: playbackState === 'PLAYING' ? '#ef4444' : 'inherit' }} title="정지">⏹️</button>
+          <button onClick={() => handlePlay('ALL')} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState !== 'STOPPED' ? 0.5 : 1 }} title="처음부터 재생">⏪</button>
+          <button onClick={() => handlePlay('MEASURE')} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState !== 'STOPPED' ? 0.5 : 1 }} title="해당 마디부터 재생 (Space)">⏯️</button>
+          <button onClick={() => handlePlay('CURSOR')} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', opacity: playbackState !== 'STOPPED' ? 0.5 : 1 }} title="커서 위치부터 재생">▶️</button>
+          
+          {/* 🔴 라이브 레코딩 버튼 */}
+          <button 
+            onClick={() => handlePlay('RECORD')} 
+            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', color: playbackState === 'RECORDING' ? '#ef4444' : 'inherit', animation: playbackState === 'RECORDING' ? 'pulse 1s infinite' : 'none' }} 
+            title="해당 마디부터 실시간 녹음 (4박자 카운트인)"
+          >⏺️</button>
+
+          <button onClick={handleStop} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', display: 'flex', alignItems: 'center', color: playbackState !== 'STOPPED' ? '#ef4444' : 'inherit' }} title="정지 (Space)">⏹️</button>
         </div>
         
         {/* 💾 데이터 관리 버튼 그룹 */}
