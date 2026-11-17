@@ -1,0 +1,299 @@
+/* 기타 TAB 에디터 스타일
+   - 색은 모두 변수로 두고 data-theme(light/dark)에 따라 바뀜
+   - 악보 프로그램 관례: 회색 작업 영역 위에 종이(page), 위쪽 도구 줄, 아래쪽 상태 줄 */
+
+:root,
+[data-theme='light'] {
+  --chrome: #dcdddf;        /* 도구 줄, 상태 줄 */
+  --chrome-2: #cdcfd2;      /* 눌린 버튼, 그룹 배경 */
+  --chrome-3: #eef0f1;      /* 입력칸 */
+  --line: #a9acb1;          /* 테두리, 구분선 */
+  --text: #2a2d31;
+  --muted: #5e6369;
+  --workspace: #b7bbc1;     /* 종이 바깥 */
+  --page: #ffffff;          /* 종이 */
+  --ink: #000000;           /* 악보 글자와 마디줄 */
+  --staff: #7a7f86;         /* 줄(현) */
+  --accent: #2c6bb0;        /* 선택 */
+  --accent-soft: rgba(44, 107, 176, 0.16);
+  --accent-text: #ffffff;
+  --play: #c4432f;          /* 진행 바, 녹음, 오류 */
+  --key-white: #f7f7f7;
+  --key-black: #2a2d31;
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --chrome: #2d2f33;
+  --chrome-2: #3a3d42;
+  --chrome-3: #232528;
+  --line: #4a4e54;
+  --text: #dadce0;
+  --muted: #9aa0a6;
+  --workspace: #1b1c1e;
+  --page: #232527;
+  --ink: #ecedee;
+  --staff: #6f747b;
+  --accent: #6ca3e3;
+  --accent-soft: rgba(108, 163, 227, 0.22);
+  --accent-text: #10243b;
+  --play: #ef6a52;
+  --key-white: #c9ccd0;
+  --key-black: #17181a;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; height: 100%; }
+
+body {
+  font-family: 'IBM Plex Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--workspace);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: var(--workspace);
+  color: var(--text);
+}
+
+/* --- 도구 줄 --- */
+
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 0;
+  padding: 4px 8px;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.tool-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-right: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.tool-group:last-child { border-right: none; }
+.toolbar .spacer { flex: 1; }
+.tool-group.end { border-right: none; }
+
+.tool-label {
+  color: var(--muted);
+  margin-right: 2px;
+}
+
+.tbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 26px;
+  min-width: 26px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.tbtn:hover:not(:disabled) { background: var(--chrome-2); border-color: var(--line); }
+.tbtn:disabled { color: var(--muted); opacity: 0.45; cursor: default; }
+.tbtn[aria-pressed='true'] { background: var(--chrome-2); border-color: var(--line); }
+.tbtn.is-recording { color: var(--play); }
+.tbtn.is-recording svg { animation: rec-blink 1s steps(2, start) infinite; }
+.tbtn svg { display: block; }
+.tbtn:focus-visible, .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+@keyframes rec-blink { to { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .tbtn.is-recording svg { animation: none; } }
+
+/* 둘 중 하나를 고르는 버튼 묶음 (모드, 음색) */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.seg button {
+  height: 24px;
+  padding: 0 9px;
+  border: none;
+  border-right: 1px solid var(--line);
+  background: var(--chrome-3);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.seg button:last-child { border-right: none; }
+.seg button[aria-pressed='true'] { background: var(--accent); color: var(--accent-text); }
+
+.field {
+  height: 24px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--chrome-3);
+  color: var(--text);
+  font: inherit;
+  padding: 0 4px;
+}
+.field.bpm { width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.tone-range { width: 64px; accent-color: var(--accent); }
+
+/* --- 작업 영역과 종이 --- */
+
+.workspace {
+  flex: 1;
+  overflow-x: auto;
+  padding: 24px 24px 40px;
+}
+
+.page {
+  position: relative;
+  width: max-content;
+  margin: 0 auto;
+  padding: 28px 28px 12px;
+  background: var(--page);
+  border: 1px solid var(--line);
+}
+
+.score-line {
+  display: flex;
+  margin-bottom: 30px;
+  position: relative;
+}
+
+.playhead {
+  position: absolute;
+  display: none;
+  width: 2px;
+  background: var(--play);
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* --- 상태 줄 --- */
+
+.statusbar {
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
+  background: var(--chrome);
+  border-top: 1px solid var(--line);
+}
+
+.status-row {
+  display: flex;
+  align-items: stretch;
+  height: 24px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.status-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-right: 1px solid var(--line);
+  color: var(--muted);
+}
+.status-cell b { color: var(--text); font-weight: 600; }
+.status-cell.on b { color: var(--accent); }
+.status-msg { flex: 1; display: flex; align-items: center; padding: 0 10px; justify-content: flex-end; }
+.status-msg.error { color: var(--play); }
+
+kbd {
+  font: inherit;
+  font-size: 11px;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  background: var(--chrome-3);
+  color: var(--text);
+}
+
+/* --- 건반 --- */
+
+.keyboard {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 0 10px;
+}
+.key-row { display: flex; gap: 3px; }
+.piano-key {
+  position: relative;
+  width: 34px;
+  height: 32px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 2px;
+  background: var(--key-white);
+  border: 1px solid var(--line);
+  border-radius: 0 0 3px 3px;
+  color: #55595f;
+  font-size: 10px;
+}
+.piano-key .black {
+  position: absolute;
+  top: -1px;
+  right: -11px;
+  width: 20px;
+  height: 18px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 1px;
+  background: var(--key-black);
+  border-radius: 0 0 2px 2px;
+  color: #c9ccd0;
+  font-size: 9px;
+  z-index: 2;
+}
+.piano-key.down, .piano-key .black.down { background: var(--accent); color: var(--accent-text); }
+
+/* --- 단축키 안내 --- */
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+}
+.sheet {
+  width: min(560px, 92vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  background: var(--page);
+  color: var(--text);
+  border: 1px solid var(--line);
+  padding: 16px 20px 18px;
+}
+.sheet:focus { outline: none; }
+.sheet h2 { font-size: 15px; margin: 0 0 4px; }
+.sheet h3 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); font-weight: 600; }
+.sheet table { width: 100%; border-collapse: collapse; }
+.sheet td { padding: 4px 0; border-bottom: 1px solid var(--chrome-2); vertical-align: top; }
+.sheet td:first-child { width: 150px; }
+.sheet .close-row { display: flex; justify-content: flex-end; margin-top: 14px; }
