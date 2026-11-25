@@ -20,6 +20,7 @@
   --play: #c4432f;          /* 진행 바, 녹음, 오류 */
   --key-white: #f7f7f7;
   --key-black: #2a2d31;
+  --roll-note: #2c6bb0;     /* 튜토리얼 막대와 눌린 건반 */
   color-scheme: light;
 }
 
@@ -40,6 +41,7 @@
   --play: #ef6a52;
   --key-white: #c9ccd0;
   --key-black: #17181a;
+  --roll-note: #5b98dd;
   color-scheme: dark;
 }
 
@@ -88,6 +90,9 @@ body {
 }
 .tool-group:last-child { border-right: none; }
 .toolbar .spacer { flex: 1; }
+/* 툴바를 정해진 자리에서 두 줄로 나눔 (창 폭에 따라 아무 데서나 꺾이지 않게) */
+.toolbar-break { flex-basis: 100%; height: 0; }
+.tool-group:has(+ .toolbar-break) { border-right: none; }
 .tool-group.end { border-right: none; }
 
 .tool-label {
@@ -166,15 +171,43 @@ body {
   position: relative;
   width: max-content;
   margin: 0 auto;
-  padding: 28px 28px 12px;
+  padding: 20px 28px 4px;
   background: var(--page);
   border: 1px solid var(--line);
 }
 
-.score-line {
-  display: flex;
-  margin-bottom: 30px;
+/* 원곡 튜토리얼: 악보 줄과 같은 폭, 높이는 화면에 맞춤 */
+.piano-roll {
   position: relative;
+  width: 1200px;
+  height: clamp(360px, calc(100vh - 180px), 860px);
+  margin-bottom: 16px;
+}
+.piano-roll canvas { display: block; }
+
+.score-line {
+  position: relative;
+  margin-bottom: 18px;
+}
+/* VexFlow가 그린 악보 위에 커서·선택·클릭을 받는 투명한 층을 겹침 */
+.score-line .vf-layer,
+.score-line .score-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+.score-line .vf-layer svg { display: block; overflow: visible; }
+.score-line .score-overlay { overflow: visible; }
+/* VexFlow는 음표 기둥에 검정(stroke="black")을 직접 넣음 → 테마 글자색으로 덮어씀 */
+.score-line .vf-layer .vf-stem { stroke: var(--ink); }
+
+/* TAB 숫자와 선택 표시 숫자: 좁은 글꼴
+   (font-family가 있는 text만: 뮤트 X 같은 음악 기호는 Bravura 글꼴을 그대로 써야 함) */
+.vf-layer .vf-tabnote text[font-family],
+.score-overlay .fret-text {
+  /* 숫자는 IBM Plex에서, 숫자가 아닌 음악 기호(꼬리 등)는 글자마다 Bravura로 넘어감 */
+  font-family: 'IBM Plex Sans Condensed', 'Arial Narrow', Bravura, sans-serif;
+  font-weight: 600;
 }
 
 .playhead {
@@ -184,6 +217,56 @@ body {
   background: var(--play);
   pointer-events: none;
   z-index: 5;
+}
+
+/* --- 원곡 정보 (MIDI에서 가져온 음) --- */
+
+/* 원곡 표와 악보 종이를 같은 폭으로 맞춤 (둘 중 넓은 쪽 기준) */
+.sheet-column {
+  display: flex;
+  flex-direction: column;
+  width: max-content;
+  min-width: 100%;
+  margin: 0 auto;
+}
+.sheet-column .page { width: auto; margin: 0; }
+
+.source-panel {
+  margin-bottom: 12px;
+  background: var(--page);
+  border: 1px solid var(--line);
+}
+.source-head {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 4px 6px 4px 0;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.source-head > span:not(.spacer) {
+  padding: 0 12px;
+  border-right: 1px solid var(--line);
+  color: var(--muted);
+}
+.source-head b { color: var(--text); font-weight: 600; }
+.source-head .source-title b { font-size: 14px; }
+.source-head .spacer { flex: 1; }
+
+.source-tracks { width: 100%; border-collapse: collapse; }
+.source-tracks th, .source-tracks td { padding: 5px 12px; text-align: left; border-bottom: 1px solid var(--chrome-2); }
+.source-tracks th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.source-tracks tr:last-child td { border-bottom: none; }
+.source-tracks .num { text-align: right; font-variant-numeric: tabular-nums; }
+.source-tracks .over { color: var(--play); font-weight: 600; cursor: help; }
+
+.cache-warning {
+  margin: 0 0 12px;
+  padding: 6px 10px;
+  border: 1px solid var(--play);
+  color: var(--play);
+  background: var(--page);
 }
 
 /* --- 상태 줄 --- */

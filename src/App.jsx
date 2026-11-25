@@ -1,8 +1,13 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   IconPlayFromStart, IconPlayMeasure, IconPlay, IconRecord, IconStop, IconMetronome,
-  IconSetLength, IconExtend, IconOpen, IconSave, IconNew, IconSun, IconMoon, IconHelp,
+  IconSetLength, IconExtend, IconOpen, IconSave, IconNew, IconSun, IconMoon, IconHelp, IconMidi,
 } from './components/Icons';
+import { parseMidi, summarizeTrack, countMeasures, pitchName } from './lib/midiImport';
+import { VIEW_STAFF, VIEW_BOTH, VIEW_TAB, DEFAULT_NOTATION, pitchLabel, timeToX } from './lib/notation';
+import ScoreView, { findMeasure, measureSpanY } from './components/ScoreView';
+import PianoRoll from './components/PianoRoll';
+import { buildScoreTimeline, measureTime, measureAt } from './lib/tutorial';
 import {
   getAudioCtx, getOutputLatency, resumeAudioCtx, createBus, stopBus,
   playTone, playPercussiveMute, playMetronomeClick, releaseVoice,
@@ -11,32 +16,22 @@ import {
 } from './lib/audio';
 import {
   TPQ, DURATION_STEPS, TIME_SIG_DENOMINATORS, MAX_TIME_SIG_NUM,
-  getTimeSig, timeSigLength, beatUnitTicks, measureLength, measureLengthAt, timeSigAt, sameTimeSig,
+  getTimeSig, timeSigLength, beatUnitTicks, measureLength, measureLengthAt, timeSigAt,
   makeMeasure, createEmptyScore, cloneScore, ensureMeasures,
   buildMeasureStarts, toAbs, fromAbs, moveCursor, splitSpanByMeasures,
   loadScoreData, serializeScore, formatBeats,
 } from './lib/scoreModel';
+import { STANDARD_TUNING as TUNING, LOWEST_PITCH, noteOnString, lowestFretString, noteId, findNoteById, assignStrings } from './lib/guitar';
+import { PIANO_LOWEST, PIANO_HIGHEST } from './lib/tutorial';
 
 // --- 상수 모음 ---
-const UNIT = 50; // 4분음표 1개(기본 밀도)의 가로 폭(px)
-const MAX_LINE_WIDTH = 24; // 한 줄의 최대 폭 (UNIT 단위)
-const MIN_MEASURE_WIDTH = 2; // 아주 짧은 마디도 이 폭 이상으로 그림
-const SIDE_PADDING = 20;
-const STRING_COUNT = 6;
-const STRING_SPACING = 20;
-const TOP_PADDING = 30;
-const HEIGHT = TOP_PADDING + STRING_SPACING * 5 + 30;
-const CLEF_WIDTH = 30; // 줄 머리(TAB 표시) 폭
-const FRET_FONT = "'IBM Plex Sans Condensed', 'Arial Narrow', sans-serif"; // 악보 숫자는 좁은 글꼴
 const DEFAULT_BPM = 120;
 const STORAGE_KEY = 'tabEditorScore';
 
-const TUNING = { 1: 64, 2: 59, 3: 55, 4: 50, 5: 45, 6: 40 };
 
 // 재생 스케줄링: 소리는 이 시간만큼 앞서서만 예약 (긴 곡도 한꺼번에 예약하지 않음)
 const SCHEDULE_LOOKAHEAD_SEC = 1.5;
 const SCHEDULE_INTERVAL_MS = 100;
-const PLAYHEAD_HEIGHT = STRING_SPACING * 5 + 14; // 줄 위아래로 7px씩
 
 // 스트럼: 재생 시 화음을 6번줄 → 1번줄 순서(다운스트로크)로 조금씩 늦게 침
 const STRUM_STEP_SEC = 0.012;     // 줄 사이 간격
@@ -46,6 +41,33 @@ const BRIGHTNESS_STORAGE_KEY = 'tabEditorToneBrightness';
 const EQ_STORAGE_KEY = 'tabEditorEq';
 
 const THEME_STORAGE_KEY = 'tabEditorTheme';
+const VIEW_STORAGE_KEY = 'tabEditorView';
+
+const VIEW_TUTORIAL = 'tutorial'; // 튜토: 악보를 피아노 튜토리얼로 (편집 없음, 악보에 음이 있을 때만)
+const VIEWS = [
+  { id: VIEW_STAFF, label: '오선보' },
+  { id: VIEW_BOTH, label: '둘 다' },
+  { id: VIEW_TAB, label: 'TAB' },
+  { id: VIEW_TUTORIAL, label: '튜토' },
+];
+const loadView = () => {
+  try {
+    const saved = localStorage.getItem(VIEW_STORAGE_KEY);
+    if (VIEWS.some(v => v.id === saved)) return saved;
+  } catch { /* 저장된 값 없음 */ }
+  return VIEW_BOTH;
+};
+
+// 오선보 종류: 높은음(기타 관례) / 큰보표(피아노). 큰보표는 나누는 음 이상이 위 줄
+const NOTATION_STORAGE_KEY = 'tabEditorNotation';
+const SPLIT_CHOICES = Array.from({ length: 72 - 36 + 1 }, (_, i) => 72 - i); // C5 ~ C2 (높은 음부터)
+const loadNotation = () => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(NOTATION_STORAGE_KEY));
+    if (saved && typeof saved.grand === 'boolean' && SPLIT_CHOICES.includes(saved.split)) return saved;
+  } catch { /* 저장된 값 없음 */ }
+  return DEFAULT_NOTATION;
+};
 const STATUS_CLEAR_MS = 4000;
 
 // 저장된 테마, 없으면 운영체제 설정을 따름
@@ -83,12 +105,19 @@ const loadCachedData = () => {
     if (saved) {
       const data = loadScoreData(JSON.parse(saved));
       if (data) return data;
+      // 읽을 수 없는 형식(예: 더 새 버전에서 저장한 캐시)은 빈 악보로 덮어쓰기 전에 따로 보관
+      localStorage.setItem(`${STORAGE_KEY}.unreadable`, saved);
     }
   } catch (e) {
     console.error("캐시 데이터를 읽는 중 오류가 발생했습니다.", e);
   }
-  return { measures: createEmptyScore(), bpm: null };
+  return { measures: createEmptyScore(), bpm: null, source: null, instrument: 'guitar' };
 };
+
+const GUITAR_MAX_NOTES = 6; // 기타가 동시에 낼 수 있는 최대 음 수 (원곡 표에서 넘는 트랙을 표시)
+
+// 초 → '1:04'
+const formatDuration = (sec) => `${Math.floor(sec / 60)}:${String(Math.round(sec % 60)).padStart(2, '0')}`;
 
 // 키보드 매핑
 const PIANO_MAP = {
@@ -160,20 +189,70 @@ const Knob = ({ label, value, min, max, defaultValue, onChange, title }) => {
   );
 };
 
+// 원곡(MIDI에서 가져온 음) 정보: 제목, 템포, 박자, 길이, 트랙 표
+const SourcePanel = ({ source, onClear }) => {
+  const firstTempo = source.tempos[0].bpm;
+  const firstSig = source.timeSignatures[0];
+  const tempoChanges = source.tempos.length - 1;
+  const sigChanges = source.timeSignatures.length - 1;
+
+  return (
+    <section className="source-panel" aria-label="원곡">
+      <div className="source-head">
+        <span className="source-title">원곡 <b>{source.title}</b></span>
+        <span>템포 <b>{firstTempo}</b>{tempoChanges > 0 && ` (${tempoChanges}번 바뀜)`}</span>
+        <span>박자 <b>{firstSig.num}/{firstSig.den}</b>{sigChanges > 0 && ` (${sigChanges}번 바뀜)`}</span>
+        <span>길이 <b>{countMeasures(source)}마디</b>, {formatDuration(source.durationSec)}</span>
+        <span className="spacer" />
+        <button className="tbtn" onClick={onClear}>원곡 지우기</button>
+      </div>
+      <table className="source-tracks">
+        <thead>
+          <tr><th>트랙</th><th>악기</th><th className="num">채널</th><th className="num">음 개수</th><th>음역</th><th className="num">동시 최대</th></tr>
+        </thead>
+        <tbody>
+          {source.tracks.map(track => {
+            const sum = summarizeTrack(track);
+            const overGuitar = !track.isDrum && sum.maxPolyphony > GUITAR_MAX_NOTES;
+            return (
+              <tr key={track.id}>
+                <td>{track.name}</td>
+                <td>{track.isDrum ? '드럼' : track.instrument}</td>
+                <td className="num">{track.channel}</td>
+                <td className="num">{sum.noteCount}</td>
+                <td>{track.isDrum ? '타악기' : `${pitchName(sum.lowest)} ~ ${pitchName(sum.highest)}`}</td>
+                <td className={`num${overGuitar ? ' over' : ''}`}
+                  title={overGuitar ? `기타는 동시에 최대 ${GUITAR_MAX_NOTES}음까지 낼 수 있습니다` : undefined}>
+                  {sum.maxPolyphony}음
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </section>
+  );
+};
+
+// 음의 실제 높이 (뮤트는 그 줄의 개방현)
+const soundOf = (n) => (n.mute ? TUNING[n.string] : n.pitch);
+
 // 악보의 모든 노트를 (마디, 위치, 줄) 순으로 펼친 목록
 const collectAllNotes = (score) => {
   const allNotes = [];
   score.forEach((measure, mIndex) => {
     measure.beats.forEach((beat) => {
-      Object.entries(beat.notes).forEach(([str, fret]) => {
-        allNotes.push({ mIndex, time: beat.time, string: parseInt(str, 10), fret, duration: beat.duration });
+      beat.notes.forEach((note) => {
+        allNotes.push({ mIndex, time: beat.time, id: noteId(note), string: note.string, pitch: note.pitch, mute: !!note.mute, duration: beat.duration });
       });
     });
   });
   allNotes.sort((a, b) => {
     if (a.mIndex !== b.mIndex) return a.mIndex - b.mIndex;
     if (a.time !== b.time) return a.time - b.time;
-    return a.string - b.string;
+    // 한 비트 안: 가는 줄(높은 음)부터. 줄이 없는 음은 음 높이로
+    if (a.string != null && b.string != null) return a.string - b.string;
+    return soundOf(b) - soundOf(a);
   });
   return allNotes;
 };
@@ -183,13 +262,25 @@ export default function TabEditor() {
   const [initialData] = useState(loadCachedData);
   const [score, setScore] = useState(initialData.measures);
   const [bpm, setBpm] = useState(initialData.bpm || DEFAULT_BPM);
+  // MIDI에서 가져온 원곡. 기타 악보와 따로 보관하고, 가져오기는 기타 악보를 건드리지 않음
+  const [source, setSource] = useState(initialData.source);
+  // 악기: 기타는 E2 이상·한 박자 6음(줄 수)까지, TAB 있음 / 피아노는 제한 없음, 큰보표만 (Guitar Pro의 트랙 악기처럼)
+  const [instrument, setInstrument] = useState(initialData.instrument || 'guitar');
+  const isPiano = instrument === 'piano';
 
   // 악보나 BPM이 바뀔 때마다 자동으로 캐시에 저장
+  // 원곡이 아주 크면 브라우저 저장 한도를 넘을 수 있으므로 실패해도 앱은 계속 동작
+  const [cacheFull, setCacheFull] = useState(false);
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(serializeScore(score, bpm)));
-  }, [score, bpm]);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(serializeScore(score, bpm, source, instrument)));
+      setCacheFull(false);
+    } catch {
+      setCacheFull(true);
+    }
+  }, [score, bpm, source, instrument]);
   const [editorMode, setEditorMode] = useState('INPUT'); // 'INPUT', 'SELECT', 'SYMBOL'
-  const [selectedNotes, setSelectedNotes] = useState([]); // 선택된 노트 배열: [{ mIndex, time, string }]
+  const [selectedNotes, setSelectedNotes] = useState([]); // 선택된 노트 배열: [{ mIndex, time, id, string, pitch }] (id: guitar.js noteId)
   const [isDebugMode, setIsDebugMode] = useState(false); // 박자 시각화 토글
   
   const [cursor, setCursor] = useState({ mIndex: 0, time: 0 });
@@ -198,6 +289,38 @@ export default function TabEditor() {
   const [status, setStatus] = useState(null); // 상태 줄 메시지 { text, isError }
   const statusTimerRef = useRef(null);
   const [theme, setTheme] = useState(loadTheme);
+  // 보기: 오선보만 / 둘 다 / TAB만
+  const [view, setView] = useState(loadView);
+  const [notation, setNotation] = useState(loadNotation);
+  useEffect(() => {
+    try { localStorage.setItem(NOTATION_STORAGE_KEY, JSON.stringify(notation)); } catch { /* 저장 불가 환경 */ }
+  }, [notation]);
+  // 튜토는 악보에 칠 음(뮤트 제외)이 하나라도 있어야 볼 수 있음
+  const hasPitchedNotes = useMemo(() => score.some(m => m.beats.some(b => b.notes.some(n => !n.mute))), [score]);
+  // 튜토를 골라 뒀어도 악보에 음이 없으면 악보 화면을 보여줌 (고른 값은 그대로 저장)
+  const isTutorialView = view === VIEW_TUTORIAL && hasPitchedNotes;
+  // 튜토: 악보를 초 단위 타임라인으로 (악보 BPM 기준). 편집 중엔 계산하지 않음
+  const timeline = useMemo(() => (isTutorialView ? buildScoreTimeline(score, bpm) : null), [isTutorialView, score, bpm]);
+  // 실제로 그릴 악보 보기: 튜토를 골랐으면 둘 다, 피아노는 TAB이 없으므로 오선보만
+  const scoreView = isPiano ? VIEW_STAFF : (view === VIEW_TUTORIAL ? VIEW_BOTH : view);
+  // 실제로 그릴 오선보 종류: 피아노는 큰보표 고정, 기타는 칠 수 없는 음을 빨간색으로
+  const drawNotation = useMemo(() => (isPiano
+    ? { grand: true, split: notation.split, markUnplaced: false }
+    : { grand: notation.grand, split: notation.split, markUnplaced: true }), [isPiano, notation]);
+  const rollRef = useRef(null); // PianoRoll 조작 손잡이 { getTime, setTime, START_TIME }
+  // 튜토로 들어가면 커서가 있는 마디에서 시작 (첫 음이 건반 조금 위에서 떨어지도록 1초 앞)
+  const TUTORIAL_LEAD_SEC = 1;
+  const cursorMeasureRef = useRef(0);
+  cursorMeasureRef.current = cursor.mIndex;
+  useEffect(() => {
+    const roll = rollRef.current;
+    if (!isTutorialView || !roll || !timeline) return;
+    const m = cursorMeasureRef.current;
+    roll.setTime(m === 0 ? roll.START_TIME : measureTime(timeline, m) - TUTORIAL_LEAD_SEC);
+  }, [isTutorialView, timeline]);
+  useEffect(() => {
+    try { localStorage.setItem(VIEW_STORAGE_KEY, view); } catch { /* 저장 불가 환경 */ }
+  }, [view]);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   
   // 재생 관련 상태
@@ -210,8 +333,8 @@ export default function TabEditor() {
   const scoreAreaRef = useRef(null);     // 진행 바 좌표 기준이 되는 악보 영역
   const playheadRef = useRef(null);      // 진행 바 DOM
   const playheadLineRef = useRef(null);  // 진행 바가 있는 줄 (줄이 바뀌면 스크롤)
-  const chunkElsRef = useRef({});        // `${줄}-${조각}` -> 마디 조각 svg
-  const layoutRef = useRef([]);          // 최신 레이아웃 (진행 바 계산용)
+  const lineElsRef = useRef([]);         // 악보 줄 DOM (진행 바 좌표 계산용)
+  const engravingRef = useRef(null);     // 최신 악보 배치 결과 (notation.js의 engrave)
   const scoreLenRef = useRef(score.length);
   const [isMetronome, setIsMetronome] = useState(false);
   // 음색 (삼각파 / 기타음). 악보가 아닌 개인 설정이라 따로 저장
@@ -255,7 +378,7 @@ export default function TabEditor() {
 
   // JSON 파일로 내보내기
   const handleExportJSON = () => {
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(serializeScore(score, bpm), null, 2));
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(serializeScore(score, bpm, source, instrument), null, 2));
     const downloadAnchorNode = document.createElement('a');
     downloadAnchorNode.setAttribute("href", dataStr);
     downloadAnchorNode.setAttribute("download", "guitar_tab_score.json");
@@ -277,6 +400,8 @@ export default function TabEditor() {
         if (data) {
           setScore(data.measures);
           if (data.bpm) setBpm(data.bpm);
+          setSource(data.source);
+          setInstrument(data.instrument);
           setSelectedNotes([]);
           setCursor({ mIndex: 0, time: 0 });
           showStatus("악보를 불러왔습니다.");
@@ -294,12 +419,42 @@ export default function TabEditor() {
 
   // 새 악보 (완전 초기화)
   const handleResetScore = () => {
-    if (window.confirm("지금 악보를 지우고 새 악보를 시작할까요? 저장하지 않은 내용은 사라집니다.")) {
+    if (window.confirm("지금 악보와 가져온 원곡을 지우고 새 악보를 시작할까요? 저장하지 않은 내용은 사라집니다.")) {
       setScore(createEmptyScore());
+      setSource(null);
       setSelectedNotes([]);
       setCursor({ mIndex: 0, time: 0 });
       showStatus("새 악보를 시작했습니다.");
     }
+  };
+
+  // MIDI 파일 가져오기 → 원곡으로 보관 (기타 악보는 그대로)
+  const handleImportMidi = async (e) => {
+    const file = e.target.files[0];
+    e.target.value = null; // 같은 파일을 다시 고를 수 있게
+    e.target.blur();
+    if (!file) return;
+
+    let parsed;
+    try {
+      parsed = parseMidi(await file.arrayBuffer(), file.name);
+    } catch (err) {
+      showStatus(err.message === 'NO_NOTES'
+        ? "이 MIDI 파일에는 음이 없습니다."
+        : "MIDI 파일을 읽지 못했습니다. 파일이 손상됐거나 MIDI 형식이 아닙니다.", true);
+      return;
+    }
+
+    if (source && !window.confirm(`지금 원곡(${source.title})을 ${parsed.title}(으)로 바꿀까요?`)) return;
+    setSource(parsed);
+    const noteCount = parsed.tracks.reduce((sum, t) => sum + t.notes.length, 0);
+    showStatus(`원곡을 가져왔습니다: 트랙 ${parsed.tracks.length}개, 음 ${noteCount}개`);
+  };
+
+  const handleClearSource = () => {
+    if (!window.confirm("가져온 원곡을 지울까요? 기타 악보는 그대로 남습니다.")) return;
+    setSource(null);
+    showStatus("원곡을 지웠습니다.");
   };
 
   // 박자표 변경: 커서가 있는 마디부터 끝까지 적용
@@ -325,6 +480,27 @@ export default function TabEditor() {
     document.documentElement.dataset.theme = theme;
     try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch { /* 저장 불가 환경 */ }
   }, [theme]);
+
+  // 악기 전환
+  //   기타 → 피아노: 음은 그대로, 줄 정보도 지우지 않음 (다시 기타로 오면 TAB이 그대로)
+  //   피아노 → 기타: 줄이 맞는 음은 그대로, 나머지는 가장 낮은 프렛에 배치. 못 놓는 음은 빨간색으로 남김
+  const changeInstrument = (next) => {
+    if (next === instrument) return;
+    if (playbackState !== 'STOPPED') handleStop();
+    setSelectedNotes([]);
+    if (next === 'piano') {
+      if (editorMode === 'SYMBOL') setEditorMode('INPUT');
+      setInstrument('piano');
+      showStatus("피아노로 바꿨습니다. 음 범위와 개수 제한이 없고, 큰보표로 봅니다.");
+      return;
+    }
+    const { measures, unplaced } = assignStrings(score);
+    setScore(measures);
+    setInstrument('guitar');
+    showStatus(unplaced > 0
+      ? `기타로 바꿨습니다. 기타로 칠 수 없는 음 ${unplaced}개는 빨간색으로 표시했습니다 (E2보다 낮거나 줄이 모자람).`
+      : "기타로 바꿨습니다. 모든 음을 줄에 배치했습니다.", unplaced > 0);
+  };
 
   // 모드 전환 (단축키와 도구 줄 버튼이 같이 씀). 선택 모드로 들어가면 커서에서 가장 가까운 노트를 선택
   const changeMode = (next) => {
@@ -353,36 +529,32 @@ export default function TabEditor() {
   const updatePlayhead = (abs, playScore) => {
     const el = playheadRef.current;
     const area = scoreAreaRef.current;
-    if (!el || !area) return;
+    const engraving = engravingRef.current;
+    if (!el || !area || !engraving) return;
 
     const { mIndex, time } = fromAbs(playScore, abs);
-    const lines = layoutRef.current;
-    for (let li = 0; li < lines.length; li++) {
-      for (let ci = 0; ci < lines[li].length; ci++) {
-        const ch = lines[li][ci];
-        if (ch.mIndex !== mIndex || time < ch.timeStart || time >= ch.timeEnd) continue;
-        const svg = chunkElsRef.current[`${li}-${ci}`];
-        if (!svg) continue;
+    const found = findMeasure(engraving, mIndex);
+    const lineEl = found && lineElsRef.current[found.lineIndex];
+    if (!found || !lineEl) {
+      el.style.display = 'none'; // 악보 밖 (녹음 중 아직 없는 마디 등)
+      return;
+    }
 
-        const areaRect = area.getBoundingClientRect();
-        const r = svg.getBoundingClientRect();
-        const inner = r.width - SIDE_PADDING * 2;
-        const x = r.left - areaRect.left + SIDE_PADDING + ((time - ch.timeStart) / (ch.timeEnd - ch.timeStart)) * inner;
-        el.style.display = 'block';
-        el.style.left = `${x - 1}px`;
-        el.style.top = `${r.top - areaRect.top + TOP_PADDING - 7}px`;
+    const areaRect = area.getBoundingClientRect();
+    const r = lineEl.getBoundingClientRect();
+    const [y0, y1] = measureSpanY(found.measure);
+    el.style.display = 'block';
+    el.style.left = `${r.left - areaRect.left + timeToX(found.measure, time) - 1}px`;
+    el.style.top = `${r.top - areaRect.top + y0}px`;
+    el.style.height = `${y1 - y0}px`;
 
-        // 다음 줄로 넘어가면 화면을 따라 스크롤 (하단 건반 패널에 가리지 않게)
-        if (playheadLineRef.current !== li) {
-          playheadLineRef.current = li;
-          if (r.top < 0 || r.bottom > window.innerHeight - 200) {
-            window.scrollBy({ top: r.top - 120, behavior: 'smooth' });
-          }
-        }
-        return;
+    // 다음 줄로 넘어가면 화면을 따라 스크롤 (하단 건반 패널에 가리지 않게)
+    if (playheadLineRef.current !== found.lineIndex) {
+      playheadLineRef.current = found.lineIndex;
+      if (r.top < 0 || r.bottom > window.innerHeight - 200) {
+        window.scrollBy({ top: r.top - 120, behavior: 'smooth' });
       }
     }
-    el.style.display = 'none'; // 악보 밖 (녹음 중 아직 없는 마디 등)
   };
 
   // 재생 종료. hardStop이면 예약된 소리까지 끊고, 아니면(곡이 자연스럽게 끝남) 여운을 남김
@@ -482,23 +654,25 @@ export default function TabEditor() {
         endAbs = Math.max(endAbs, absTime + beat.duration);
         if (skipSound) return;
 
-        // 다운스트로크: 굵은 줄(6번)부터 순서대로 시차를 둠
-        const entries = Object.entries(beat.notes)
-          .map(([string, fret]) => [parseInt(string, 10), fret])
-          .sort((a, b) => b[0] - a[0]);
-        const strumStep = entries.length > 1
+        // 기타: 다운스트로크처럼 굵은 줄(6번, 낮은 음)부터 시차를 둠. 피아노: 동시에
+        const entries = [...beat.notes].sort((a, b) => (!isPiano && a.string != null && b.string != null
+          ? b.string - a.string
+          : soundOf(a) - soundOf(b)));
+        const strumStep = !isPiano && entries.length > 1
           ? Math.min(STRUM_STEP_SEC, (beat.duration * secondsPerTick * STRUM_MAX_RATIO) / (entries.length - 1))
           : 0;
 
-        entries.forEach(([string, fret], i) => {
+        entries.forEach((note, i) => {
           const offsetSec = i * strumStep;
-          if (fret === 'X') {
-            events.push({ abs: absTime, offsetSec, string, mute: true });
+          if (note.mute) {
+            events.push({ abs: absTime, offsetSec, voice: `s${note.string}`, mute: true });
             return;
           }
           // 노트별 울림 길이(sustain)가 있으면 우선 사용
-          const noteTicks = (beat.sustain && beat.sustain[string]) || durTicks;
-          events.push({ abs: absTime, offsetSec, string, midi: TUNING[string] + fret, ticks: noteTicks });
+          const noteTicks = note.sustain || durTicks;
+          // 기타는 줄마다 한 소리, 피아노(또는 줄 없는 음)는 건반마다 한 소리
+          const voice = !isPiano && note.string != null ? `s${note.string}` : `p${note.pitch}`;
+          events.push({ abs: absTime, offsetSec, voice, midi: note.pitch, ticks: noteTicks });
           endAbs = Math.max(endAbs, absTime + noteTicks);
         });
       });
@@ -522,7 +696,7 @@ export default function TabEditor() {
 
     // 스케줄러: 앞으로 SCHEDULE_LOOKAHEAD_SEC 안에 나올 소리만 예약
     let nextEvent = 0;
-    const voiceOnString = {}; // 줄마다 지금 울리고 있는 음 (같은 줄에 새 음이 오면 끊음)
+    const voiceOnString = {}; // 줄(피아노는 건반)마다 지금 울리고 있는 음 (같은 자리에 새 음이 오면 끊음)
     const schedule = () => {
       const horizon = ctx.currentTime + SCHEDULE_LOOKAHEAD_SEC;
 
@@ -530,12 +704,12 @@ export default function TabEditor() {
         const ev = events[nextEvent++];
         const t = toSec(ev.abs) + ev.offsetSec;
         // 실제 기타처럼 한 줄에는 한 소리만: 앞 음을 끊고 새 음(또는 뮤트)
-        releaseVoice(voiceOnString[ev.string], t);
+        releaseVoice(voiceOnString[ev.voice], t);
         if (ev.mute) {
           playPercussiveMute(t, bus);
-          voiceOnString[ev.string] = null;
+          voiceOnString[ev.voice] = null;
         } else {
-          voiceOnString[ev.string] = playTone(ev.midi, t, ev.ticks * secondsPerTick, bus);
+          voiceOnString[ev.voice] = playTone(ev.midi, t, ev.ticks * secondsPerTick, bus);
         }
       }
 
@@ -581,54 +755,60 @@ export default function TabEditor() {
     schedule();
     session.schedTimer = setInterval(schedule, SCHEDULE_INTERVAL_MS);
     session.rafId = requestAnimationFrame(frame);
-  }, [score, bpm, cursor, handleStop, finishPlayback, isMetronome]);
+  }, [score, bpm, cursor, handleStop, finishPlayback, isMetronome, isPiano]);
 
-  // 줄바꿈 레이아웃: 마디 폭 = 박자표 길이 × 밀도 (짧은 음표가 있으면 넓게)
-  const layout = useMemo(() => {
-    const lines = [];
-    let currentLineChunks = [];
-    let currentRemaining = MAX_LINE_WIDTH;
+  // 튜토 재생: 튜토 화면의 지금 위치부터, 화면에 떨어지는 막대 그대로 소리냄
+  //    - 정지하면 그 자리에 멈춤 (다시 누르면 이어서). 끝까지 갔으면 처음부터
+  const handlePlayTutorial = useCallback(async (fromStart = false) => {
+    const roll = rollRef.current;
+    if (!timeline || !roll) return;
+    handleStop();
+    const token = playTokenRef.current;
+    const ctx = await resumeAudioCtx();
+    if (token !== playTokenRef.current) return;
 
-    score.forEach((measure, mIndex) => {
-      const len = measureLength(measure);
-      const timeSig = getTimeSig(measure);
-      // 첫 마디이거나 박자표가 바뀌는 마디에만 박자표 표시
-      const showTimeSig = mIndex === 0 || !sameTimeSig(timeSig, getTimeSig(score[mIndex - 1]));
+    let startPos = fromStart ? roll.START_TIME : roll.getTime();
+    if (startPos >= timeline.duration - 0.05) startPos = roll.START_TIME;
+    roll.setTime(startPos);
+    setPlaybackState('PLAYING');
 
-      let minDuration = len;
-      measure.beats.forEach(b => { if (b.duration < minDuration) minDuration = b.duration; });
+    const bus = createBus();
+    const ctxStart = ctx.currentTime + 0.1;
+    const toCtx = (sec) => ctxStart + (sec - startPos);
 
-      // 4분음표당 UNIT 개수: 기본 1, 8분음표 이하가 있으면 2, 16분음표 이하가 있으면 4
-      let density = 1;
-      if (minDuration <= TPQ / 4) density = 4;
-      else if (minDuration <= TPQ / 2) density = 2;
-      const W = Math.min(MAX_LINE_WIDTH, Math.max(MIN_MEASURE_WIDTH, (len / TPQ) * density));
-
-      let R = currentRemaining;
-      if (R <= 0) { lines.push(currentLineChunks); currentLineChunks = []; R = MAX_LINE_WIDTH; }
-
-      const base = { mIndex, measureId: measure.id, timeSig, showTimeSig };
-
-      if (W <= R) {
-        currentLineChunks.push({ ...base, beats: measure.beats, width: W, timeStart: 0, timeEnd: len, type: 'full' });
-        currentRemaining = R - W;
-      } else {
-        const timeBoundary = len * (R / W);
-
-        currentLineChunks.push({ ...base, beats: measure.beats.filter(b => b.time < timeBoundary), width: R, timeStart: 0, timeEnd: timeBoundary, type: 'start' });
-        lines.push(currentLineChunks); currentLineChunks = [];
-
-        const wRemaining = W - R;
-        currentLineChunks.push({ ...base, showTimeSig: false, beats: measure.beats.filter(b => b.time >= timeBoundary), width: wRemaining, timeStart: timeBoundary, timeEnd: len, type: 'end' });
-        currentRemaining = MAX_LINE_WIDTH - wRemaining;
+    // 시작 위치에서 이미 울리고 있던 음은 남은 길이만큼, 그 뒤 음은 처음부터
+    const events = timeline.notes.filter(n => n.end > startPos + 0.01);
+    let next = 0;
+    const voiceOnPitch = {}; // 같은 음이 겹치면 앞 소리를 끊음 (피아노도 같은 건반은 다시 누르면 새로 울림)
+    const schedule = () => {
+      const horizon = ctx.currentTime + SCHEDULE_LOOKAHEAD_SEC;
+      while (next < events.length && toCtx(Math.max(events[next].start, startPos)) < horizon) {
+        const n = events[next++];
+        const from = Math.max(n.start, startPos);
+        const t = toCtx(from);
+        releaseVoice(voiceOnPitch[n.pitch], t);
+        voiceOnPitch[n.pitch] = playTone(n.pitch, t, n.end - from, bus);
       }
-    });
+    };
 
-    if (currentLineChunks.length > 0) lines.push(currentLineChunks);
-    return lines;
-  }, [score]);
+    const session = { bus, schedTimer: null, rafId: null };
+    const frame = () => {
+      if (playbackRef.current !== session) return;
+      const heard = startPos + Math.max(0, ctx.currentTime - getOutputLatency() - ctxStart);
+      roll.setTime(Math.min(heard, timeline.duration));
+      if (heard >= timeline.duration) {
+        finishPlayback(false);
+        return;
+      }
+      session.rafId = requestAnimationFrame(frame);
+    };
 
-  useEffect(() => { layoutRef.current = layout; }, [layout]);
+    playbackRef.current = session;
+    schedule();
+    session.schedTimer = setInterval(schedule, SCHEDULE_INTERVAL_MS);
+    session.rafId = requestAnimationFrame(frame);
+  }, [timeline, handleStop, finishPlayback]);
+
   useEffect(() => { scoreLenRef.current = score.length; }, [score.length]);
 
   // 화면을 떠날 때 재생 정리
@@ -680,7 +860,7 @@ export default function TabEditor() {
         const measure = newScore[seg.mIndex];
         let beat = measure.beats.find(b => b.time === seg.time);
         if (!beat) {
-          beat = { time: seg.time, duration: seg.duration, notes: {}, tieId };
+          beat = { time: seg.time, duration: seg.duration, notes: [], tieId };
           measure.beats.push(beat);
         }
         return { measure, beat };
@@ -693,33 +873,36 @@ export default function TabEditor() {
         let midi = PIANO_MAP[key];
         if (isOctaveDown) midi -= 12;
 
-        if (midi < 40) {
+        // 피아노: 줄 없이 음 높이만. 같은 음이 이미 있으면 그대로 둠
+        if (isPiano) {
+          if (midi < PIANO_LOWEST || midi > PIANO_HIGHEST) { outOfRange = true; return; }
+          segBeats.forEach(({ beat }) => {
+            if (!beat.notes.some(n => !n.mute && n.pitch === midi)) beat.notes.push({ pitch: midi });
+          });
+          return;
+        }
+
+        if (midi < LOWEST_PITCH) {
           outOfRange = true;
           return;
         }
 
         // 모든 조각에서 비어 있는 줄 중 가장 낮은 프렛
-        let bestString = null, minFret = 999;
-        for (let s = 1; s <= 6; s++) {
-          const fret = midi - TUNING[s];
-          if (fret >= 0 && fret <= 24 && fret < minFret && segBeats.every(({ beat }) => beat.notes[s] === undefined)) {
-            minFret = fret; bestString = s;
-          }
-        }
+        const bestString = lowestFretString(midi, (s) => segBeats.every(({ beat }) => !noteOnString(beat, s)));
 
         if (bestString) {
-          segBeats.forEach(({ beat }) => { beat.notes[bestString] = minFret; });
+          segBeats.forEach(({ beat }) => { beat.notes.push({ pitch: midi, string: bestString }); });
         } else {
           collisionOccurred = true;
         }
       });
 
-      if (outOfRange) showStatus("스탠다드 튜닝(E2) 범위를 벗어나는 저음입니다.", true);
+      if (outOfRange) showStatus(isPiano ? "피아노 건반(A0~C8) 범위를 벗어나는 음입니다." : "스탠다드 튜닝(E2) 범위를 벗어나는 저음입니다.", true);
       else if (collisionOccurred) showStatus("빈 줄이 없어서 입력하지 못했습니다.", true);
 
       // 노트가 하나도 안 들어간 비트는 제거
       segBeats.forEach(({ measure, beat }) => {
-        if (Object.keys(beat.notes).length === 0) measure.beats = measure.beats.filter(b => b !== beat);
+        if (beat.notes.length === 0) measure.beats = measure.beats.filter(b => b !== beat);
       });
 
       return newScore;
@@ -789,14 +972,13 @@ export default function TabEditor() {
 
       const existingBeat = rebuiltScore[mIdx].beats.find(eb => eb.time === localTime);
       if (existingBeat) {
-        existingBeat.notes = { ...existingBeat.notes, ...b.notes };
-        if (b.sustain) existingBeat.sustain = { ...existingBeat.sustain, ...b.sustain };
+        // 같은 음(같은 줄, 또는 줄 없는 같은 높이)이면 뒤에 온 노트가 이김
+        const incoming = new Set(b.notes.map(noteId));
+        existingBeat.notes = [...existingBeat.notes.filter(n => !incoming.has(noteId(n))), ...b.notes];
         // 한 행에 화음이 부딪혀 겹쳤을 때 "가장 짧은 노트 기준" 반영
         existingBeat.duration = Math.min(existingBeat.duration, b.duration);
       } else {
-        const beat = { time: localTime, duration: b.duration, notes: b.notes, tieId: b.tieId };
-        if (b.sustain) beat.sustain = b.sustain;
-        rebuiltScore[mIdx].beats.push(beat);
+        rebuiltScore[mIdx].beats.push({ time: localTime, duration: b.duration, notes: b.notes, tieId: b.tieId });
       }
     });
 
@@ -850,7 +1032,7 @@ export default function TabEditor() {
     const starts = buildMeasureStarts(score);
     const noteAbsTimes = [];
     score.forEach((m, mIdx) => m.beats.forEach(b => {
-      if (Object.keys(b.notes).length > 0) noteAbsTimes.push(starts[mIdx] + b.time);
+      if (b.notes.length > 0) noteAbsTimes.push(starts[mIdx] + b.time);
     }));
     noteAbsTimes.sort((a, b) => a - b);
 
@@ -858,8 +1040,8 @@ export default function TabEditor() {
     const groups = new Map();
     selectedNotes.forEach(sel => {
       const key = `${sel.mIndex}-${sel.time}`;
-      if (!groups.has(key)) groups.set(key, { mIndex: sel.mIndex, time: sel.time, strings: new Set() });
-      groups.get(key).strings.add(sel.string);
+      if (!groups.has(key)) groups.set(key, { mIndex: sel.mIndex, time: sel.time, ids: new Set() });
+      groups.get(key).ids.add(sel.id);
     });
 
     const newScore = cloneScore(score);
@@ -874,25 +1056,21 @@ export default function TabEditor() {
       if (nextAbs === undefined) { lastOnes += 1; return; }
       const gap = nextAbs - abs;
 
-      const allSelected = Object.keys(beat.notes).every(s => g.strings.has(Number(s)));
+      const allSelected = beat.notes.every(n => g.ids.has(noteId(n)));
       if (allSelected) {
         // 다음 노트까지 빈 구간이므로, 마디 경계에서 나눠 붙임줄 조각을 만들어도 겹치지 않음
         const segments = splitSpanByMeasures(newScore, abs, gap);
         beat.duration = segments[0].duration;
-        if (beat.sustain) {
-          g.strings.forEach(s => { delete beat.sustain[s]; });
-          if (Object.keys(beat.sustain).length === 0) delete beat.sustain;
-        }
+        beat.notes.forEach(n => { delete n.sustain; });
         if (segments.length > 1) {
           const tieId = beat.tieId || `${Date.now()}-${abs}`;
           beat.tieId = tieId;
           segments.slice(1).forEach(seg => {
-            newScore[seg.mIndex].beats.push({ time: seg.time, duration: seg.duration, notes: { ...beat.notes }, tieId });
+            newScore[seg.mIndex].beats.push({ time: seg.time, duration: seg.duration, notes: beat.notes.map(n => ({ ...n })), tieId });
           });
         }
       } else {
-        beat.sustain = { ...(beat.sustain || {}) };
-        g.strings.forEach(s => { beat.sustain[s] = gap; });
+        beat.notes.forEach(n => { if (g.ids.has(noteId(n))) n.sustain = gap; });
       }
       changed += 1;
     });
@@ -905,6 +1083,65 @@ export default function TabEditor() {
     showStatus(lastOnes > 0
       ? "다음 노트까지 늘렸습니다. (뒤에 노트가 없는 노트는 그대로 둠)"
       : "다음 노트까지 늘렸습니다.");
+  };
+
+  // 선택된 노트들을 옮길 계획을 세움 (아무것도 바꾸지 않음)
+  //   moveOne(note, sel, isFree, isPitchFree) → { note: 옮긴 뒤의 노트 } 또는 { error }
+  //     isFree(줄): 그 줄이 비었는지 / isPitchFree(음높이): 같은 높이의 음이 없는지 (피아노)
+  //   lowFirst: 낮은 음(굵은 줄) 쪽 노트부터 처리할지. 같은 비트 안에서 노트끼리 자리를 비켜 주는 순서
+  // 반환: { moves: [{ sel, note }] } 또는 { error }
+  const planNoteMoves = (moveOne, lowFirst) => {
+    const height = (sel) => (sel.string != null && !isPiano ? -sel.string : soundOf(sel));
+    const ordered = [...selectedNotes].sort((a, b) => (lowFirst ? height(a) - height(b) : height(b) - height(a)));
+    const occupied = {}; // 비트마다 차 있는 줄과 음높이
+    const moves = [];
+
+    for (const sel of ordered) {
+      const beat = score[sel.mIndex] && score[sel.mIndex].beats.find(b => b.time === sel.time);
+      const note = beat && findNoteById(beat, sel.id);
+      if (!note) continue;
+
+      const key = `${sel.mIndex}-${sel.time}`;
+      if (!occupied[key]) {
+        // 선택된 노트들은 어차피 옮겨 가므로 처음에는 빈자리로 봄
+        const movingHere = new Set(selectedNotes.filter(s => s.mIndex === sel.mIndex && s.time === sel.time).map(s => s.id));
+        const staying = beat.notes.filter(n => !movingHere.has(noteId(n)));
+        occupied[key] = {
+          strings: new Set(staying.map(n => n.string).filter(st => st != null)),
+          pitches: new Set(staying.filter(n => !n.mute).map(n => n.pitch)),
+        };
+      }
+
+      const occ = occupied[key];
+      const result = moveOne(note, sel, (st) => !occ.strings.has(st), (p) => !occ.pitches.has(p));
+      if (result.error) return { error: result.error };
+      if (result.note.string != null) occ.strings.add(result.note.string);
+      if (!result.note.mute) occ.pitches.add(result.note.pitch);
+      moves.push({ sel, note: result.note });
+    }
+    return { moves };
+  };
+
+  // 계획한 이동을 악보에 적용하고, 옮긴 노트를 바로 들려줌
+  const applyNoteMoves = (moves) => {
+    const now = getAudioCtx().currentTime;
+    moves.forEach(({ note }) => (note.mute ? playPercussiveMute(now) : playTone(note.pitch, now, 0.4)));
+
+    setSelectedNotes(moves.map(({ sel, note }) => ({ ...sel, id: noteId(note), string: note.string, pitch: note.pitch, mute: !!note.mute })));
+    setScore(prev => {
+      const newScore = cloneScore(prev);
+      const beatOf = (sel) => newScore[sel.mIndex] && newScore[sel.mIndex].beats.find(b => b.time === sel.time);
+      // 먼저 전부 빼고 나서 넣어야 서로 자리를 바꾸는 이동도 안전함
+      moves.forEach(({ sel }) => {
+        const beat = beatOf(sel);
+        if (beat) beat.notes = beat.notes.filter(n => noteId(n) !== sel.id);
+      });
+      moves.forEach(({ sel, note }) => {
+        const beat = beatOf(sel);
+        if (beat) beat.notes.push({ ...note });
+      });
+      return newScore;
+    });
   };
 
   const handleSelectModeInput = (e) => {
@@ -924,11 +1161,11 @@ export default function TabEditor() {
           if (beatIdx !== -1) {
             const beat = measure.beats[beatIdx];
             
-            // 해당 줄(String)의 노트만 삭제 (화음의 다른 노트는 보존)
-            delete beat.notes[sel.string];
-            
+            // 선택한 노트만 삭제 (화음의 다른 노트는 보존)
+            beat.notes = beat.notes.filter(n => noteId(n) !== sel.id);
+
             // 만약 지우고 났더니 해당 박자에 남은 노트가 하나도 없다면 비트 자체를 삭제
-            if (Object.keys(beat.notes).length === 0) {
+            if (beat.notes.length === 0) {
               measure.beats.splice(beatIdx, 1);
             }
           }
@@ -955,12 +1192,13 @@ export default function TabEditor() {
     if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
       const isNext = e.key === 'ArrowRight';
       const referenceNote = isNext ? selectedNotes[selectedNotes.length - 1] : selectedNotes[0];
-      const currentIndex = allNotes.findIndex(n => n.mIndex === referenceNote.mIndex && n.time === referenceNote.time && n.string === referenceNote.string);
+      const same = (a, b) => a.mIndex === b.mIndex && a.time === b.time && a.id === b.id;
+      const currentIndex = allNotes.findIndex(n => same(n, referenceNote));
 
       if (isNext && currentIndex !== -1 && currentIndex < allNotes.length - 1) {
         const targetNote = allNotes[currentIndex + 1];
         if (e.shiftKey) {
-          if (!selectedNotes.some(n => n.mIndex === targetNote.mIndex && n.time === targetNote.time && n.string === targetNote.string)) {
+          if (!selectedNotes.some(n => same(n, targetNote))) {
             setSelectedNotes(prev => [...prev, targetNote]);
           }
         } else {
@@ -969,7 +1207,7 @@ export default function TabEditor() {
       } else if (!isNext && currentIndex > 0) {
         const targetNote = allNotes[currentIndex - 1];
         if (e.shiftKey) {
-          if (!selectedNotes.some(n => n.mIndex === targetNote.mIndex && n.time === targetNote.time && n.string === targetNote.string)) {
+          if (!selectedNotes.some(n => same(n, targetNote))) {
             setSelectedNotes(prev => [targetNote, ...prev]);
           }
         } else {
@@ -984,171 +1222,68 @@ export default function TabEditor() {
       const amount = e.shiftKey ? 12 : 1;
       const delta = e.key === 'ArrowUp' ? amount : -amount;
 
-      let canMove = true;
-      let errorMessage = "";
-      const plannedMoves = [];
+      // 내려갈 때는 낮은 음(굵은 줄) 쪽 노트부터, 올라갈 때는 높은 음 쪽부터 처리해야 서로 자리를 비켜 줌
+      const plan = planNoteMoves((note, sel, isFree, isPitchFree) => {
+        if (note.mute) return { note }; // 뮤트는 음높이가 없으므로 그대로
+        const targetPitch = note.pitch + delta;
 
-      // 이동 경로 확보를 위해 선택된 노트들을 이동 방향에 따라 정렬 (충돌 방지)
-      const sortedSelected = [...selectedNotes].sort((a, b) => delta < 0 ? b.string - a.string : a.string - b.string);
-
-      const beatState = {}; 
-      
-      sortedSelected.forEach(sel => {
-        const key = `${sel.mIndex}-${sel.time}`;
-        if (!beatState[key]) {
-          const measure = score[sel.mIndex];
-          const beat = measure && measure.beats.find(b => b.time === sel.time);
-          beatState[key] = beat ? { ...beat.notes } : {};
-          // 본인들이 이동할 빈자리를 만들기 위해 현재 상태에서 임시 제외
-          selectedNotes.forEach(s => {
-            if (s.mIndex === sel.mIndex && s.time === sel.time) delete beatState[key][s.string];
-          });
+        // 피아노: 음 높이만 바꿈 (줄 정보는 그대로 둠: 기타로 돌아갈 때 다시 맞춤)
+        if (isPiano) {
+          if (targetPitch < PIANO_LOWEST || targetPitch > PIANO_HIGHEST) return { error: "피아노 건반(A0~C8) 범위를 벗어납니다." };
+          if (!isPitchFree(targetPitch)) return { error: "같은 높이의 음이 이미 있습니다." };
+          return { note: { ...note, pitch: targetPitch } };
         }
-
-        if (sel.fret === 'X') {
-          plannedMoves.push(sel);
-          beatState[key][sel.string] = 'X';
-          return;
+        // 기타인데 줄이 없는 음(빨간 음): 옮긴 높이로 줄에 놓을 수 있으면 놓음
+        if (note.string == null) {
+          if (!isPitchFree(targetPitch)) return { error: "같은 높이의 음이 이미 있습니다." };
+          const s = targetPitch >= LOWEST_PITCH ? lowestFretString(targetPitch, isFree) : null;
+          return { note: s ? { ...note, pitch: targetPitch, string: s } : { ...note, pitch: targetPitch } };
         }
+        if (targetPitch < LOWEST_PITCH) return { error: "기타(E2)로 연주할 수 없는 낮은 음입니다." };
 
-        const currentPitch = TUNING[sel.string] + sel.fret;
-        const targetPitch = currentPitch + delta;
-
-        if (targetPitch < 40) {
-          canMove = false; errorMessage = "기타(E2)로 연주할 수 없는 낮은 음입니다."; return;
+        // 내려가면 굵은 줄(+1) 쪽으로, 올라가면 가는 줄(-1) 쪽으로 빈 줄을 찾음
+        const dir = delta < 0 ? 1 : -1;
+        for (let s = sel.string; s >= 1 && s <= 6; s += dir) {
+          if (targetPitch - TUNING[s] >= 0 && isFree(s)) return { note: { ...note, pitch: targetPitch, string: s } };
         }
+        return { error: "이동할 수 있는 빈 줄이 없습니다." };
+      }, delta < 0);
 
-        let bestString = null;
-        let newFret = -1;
-        // 하행(delta<0)이면 더 두꺼운 줄(+1)로, 상행이면 얇은 줄(-1) 방향으로 탐색
-        const searchDir = delta < 0 ? 1 : -1; 
-
-        for (let s = sel.string; s >= 1 && s <= 6; s += searchDir) {
-          let f = targetPitch - TUNING[s];
-          // 빈 줄을 찾을 때까지 탐색 (최대 프렛 제한 없음)
-          if (f >= 0 && beatState[key][s] === undefined) {
-            bestString = s;
-            newFret = f;
-            break;
-          }
-        }
-
-        if (bestString === null) {
-          canMove = false; errorMessage = "이동할 수 있는 빈 줄이 없습니다."; return;
-        }
-
-        beatState[key][bestString] = newFret;
-        plannedMoves.push({ ...sel, string: bestString, fret: newFret });
-      });
-
-      if (!canMove) { showStatus(errorMessage, true); return; }
-
-      // 옮긴 노트를 바로 들려줌
-      const now = getAudioCtx().currentTime;
-      plannedMoves.forEach(m => {
-        if (m.fret === 'X') {
-          playPercussiveMute(now);
-        } else {
-          const midi = TUNING[m.string] + m.fret;
-          playTone(midi, now, 0.4);
-        }
-      });
-
-      setSelectedNotes(plannedMoves);
-      setScore(prev => {
-        const newScore = cloneScore(prev);
-        selectedNotes.forEach(sel => {
-          const beat = newScore[sel.mIndex].beats.find(b => b.time === sel.time);
-          if (beat) delete beat.notes[sel.string];
-        });
-        plannedMoves.forEach(m => {
-          const beat = newScore[m.mIndex].beats.find(b => b.time === m.time);
-          if (beat) beat.notes[m.string] = m.fret;
-        });
-        return newScore;
-      });
+      if (plan.error) { showStatus(plan.error, true); return; }
+      applyNoteMoves(plan.moves);
       return;
     }
 
     // Ctrl + ↑ ↓: 같은 음을 다른 줄로 옮김 (자리가 있으면 건너뜀, 0프렛 아래면 한 옥타브 올림)
     if (e.ctrlKey && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
-      const stringDelta = e.key === 'ArrowUp' ? -1 : 1; 
-      
-      let canMove = true;
-      let errorMessage = "";
-      const plannedMoves = [];
+      e.preventDefault();
+      if (isPiano) { showStatus("피아노에는 줄이 없습니다. 줄 이동은 기타 악보에서만 됩니다.", true); return; }
+      if (selectedNotes.some(sel => sel.string == null)) {
+        showStatus("줄이 없는 음(빨간 음)이 있습니다. ↑↓로 음 높이를 옮기면 칠 수 있는 줄에 놓입니다.", true);
+        return;
+      }
+      const stringDelta = e.key === 'ArrowUp' ? -1 : 1;
 
-      const sortedSelected = [...selectedNotes].sort((a, b) => stringDelta > 0 ? b.string - a.string : a.string - b.string);
-      const beatState = {}; 
-
-      sortedSelected.forEach(sel => {
-        const key = `${sel.mIndex}-${sel.time}`;
-        if (!beatState[key]) {
-          const measure = score[sel.mIndex];
-          const beat = measure && measure.beats.find(b => b.time === sel.time);
-          beatState[key] = beat ? { ...beat.notes } : {};
-          selectedNotes.forEach(s => {
-            if (s.mIndex === sel.mIndex && s.time === sel.time) delete beatState[key][s.string];
-          });
-        }
-
-        let bestString = null;
-        // 이동하려는 방향(stringDelta)으로 빈 줄을 찾을 때까지 한 칸씩 전진
+      const plan = planNoteMoves((note, sel, isFree) => {
+        // 옮기려는 방향으로 빈 줄을 찾을 때까지 한 칸씩 전진
+        let target = null;
         for (let s = sel.string + stringDelta; s >= 1 && s <= 6; s += stringDelta) {
-          if (beatState[key][s] === undefined) {
-            bestString = s;
-            break;
-          }
+          if (isFree(s)) { target = s; break; }
         }
+        if (target === null) return { error: "더 이상 이동할 빈 줄이 없습니다." };
+        if (note.mute) return { note: { ...note, string: target } };
 
-        if (bestString === null) {
-          canMove = false; errorMessage = "더 이상 이동할 빈 줄이 없습니다."; return;
-        }
+        // 그 줄의 개방현보다 낮으면 칠 수 없으므로 한 옥타브씩 올림
+        let pitch = note.pitch;
+        while (pitch < TUNING[target]) pitch += 12;
+        return { note: { ...note, pitch, string: target } };
+      }, stringDelta > 0);
 
-        let newFret = sel.fret;
-        if (newFret !== 'X') {
-          const currentPitch = TUNING[sel.string] + sel.fret;
-          newFret = currentPitch - TUNING[bestString];
-          
-          // 0프렛 미만으로 감소하면 0 이상이 될 때까지 12프렛(1옥타브) 단위로 덧셈
-          while (newFret < 0) {
-            newFret += 12;
-          }
-        }
-
-        beatState[key][bestString] = newFret;
-        plannedMoves.push({ ...sel, string: bestString, fret: newFret });
-      });
-
-      if (!canMove) { showStatus(errorMessage, true); return; }
-
-      const now = getAudioCtx().currentTime;
-      plannedMoves.forEach(m => {
-        if (m.fret === 'X') {
-          playPercussiveMute(now);
-        } else {
-          const midi = TUNING[m.string] + m.fret;
-          playTone(midi, now, 0.4);
-        }
-      });
-
-      setSelectedNotes(plannedMoves);
-      setScore(prev => {
-        const newScore = cloneScore(prev);
-        selectedNotes.forEach(sel => {
-          const beat = newScore[sel.mIndex].beats.find(b => b.time === sel.time);
-          if (beat) delete beat.notes[sel.string];
-        });
-        plannedMoves.forEach(m => {
-          const beat = newScore[m.mIndex].beats.find(b => b.time === m.time);
-          if (beat) beat.notes[m.string] = m.fret;
-        });
-        return newScore;
-      });
+      if (plan.error) { showStatus(plan.error, true); return; }
+      applyNoteMoves(plan.moves);
       return;
     }
 
-    
     // - / =: 선택된 노트 길이 조절 (리플 편집)
     if (e.key === '-' || e.key === '=') {
       const stepChange = e.key === '=' ? 1 : -1;
@@ -1169,6 +1304,7 @@ export default function TabEditor() {
   
   // 2. 기호 모드 (SYMBOL) 컨트롤러
   const handleSymbolModeInput = (e) => {
+    if (isPiano) return; // 뮤트(X)는 기타 줄 기호
     const key = e.key;
     // 숫자 1~6을 누르면 해당 줄에 뮤트(X) 기호 추가
     if (['1', '2', '3', '4', '5', '6'].includes(key)) {
@@ -1182,11 +1318,12 @@ export default function TabEditor() {
         const duration = Math.min(currentStep, measureLength(cMeasure) - cursor.time);
         let beat = cMeasure.beats.find(b => b.time === cursor.time);
         if (!beat) {
-          beat = { time: cursor.time, duration, notes: {} };
+          beat = { time: cursor.time, duration, notes: [] };
           cMeasure.beats.push(beat);
         }
-        
-        beat.notes[stringNum] = 'X';
+
+        // 그 줄에 있던 음은 뮤트로 바뀜
+        beat.notes = [...beat.notes.filter(n => n.string !== stringNum), { string: stringNum, mute: true }];
         return newScore;
       });
     }
@@ -1208,11 +1345,16 @@ export default function TabEditor() {
       if (document.activeElement && document.activeElement.tagName === 'BUTTON') document.activeElement.blur();
       if (playbackState === 'PLAYING' || playbackState === 'RECORDING') {
         handleStop();
+      } else if (isTutorialView) {
+        handlePlayTutorial();
       } else {
         handlePlay('MEASURE');
       }
       return;
     }
+
+    // 튜토에서는 악보가 안 보이므로 편집 키를 막음
+    if (isTutorialView) return;
 
     if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) e.preventDefault();
     
@@ -1224,6 +1366,7 @@ export default function TabEditor() {
     }
     if (e.key === ']') {
       e.preventDefault();
+      if (isPiano) { showStatus("기호(뮤트 X)는 기타 악보에서만 씁니다.", true); return; }
       changeMode(editorMode === 'SYMBOL' ? 'INPUT' : 'SYMBOL');
       return;
     }
@@ -1315,7 +1458,7 @@ export default function TabEditor() {
     if (e.key === 'ArrowLeft') {
       setCursor(moveCursor(score, cursor, -currentStep));
     }
-  }, [score, cursor, durIdx, isDotted, currentStep, bpm, isOctaveDown, editorMode, selectedNotes, playbackState, handlePlay, handleStop, isHelpOpen]);
+  }, [score, cursor, durIdx, isDotted, currentStep, bpm, isOctaveDown, editorMode, selectedNotes, playbackState, handlePlay, handleStop, isHelpOpen, isTutorialView, handlePlayTutorial, isPiano]);
 
   const handleKeyUp = useCallback((e) => {
     const key = e.key.toLowerCase();
@@ -1336,7 +1479,7 @@ export default function TabEditor() {
         }
       }
     }
-  }, [score, cursor, currentStep, isOctaveDown, playbackState]);
+  }, [score, cursor, currentStep, isOctaveDown, playbackState, isPiano]);
 
   // 버튼을 마우스로 눌러도 포커스를 가져가지 않게 함 (클릭은 그대로 동작)
   //    포커스가 남아 있으면 스페이스바를 눌렀을 때 그 버튼이 다시 눌리는 문제가 있었음
@@ -1374,7 +1517,7 @@ export default function TabEditor() {
   const cursorBeat = Math.round((cursor.time / beatUnitTicks(cursorTimeSig) + 1) * 100) / 100;
 
   return (
-    <div className="app">
+    <div className="app" data-theme={theme}>
 
       {/* 도구 줄 */}
       <div className="toolbar" role="toolbar" aria-label="편집 도구">
@@ -1382,20 +1525,29 @@ export default function TabEditor() {
         <div className="tool-group">
           <div className="seg" role="group" aria-label="편집 모드">
             {MODES.map(m => (
-              <button key={m.id} aria-pressed={editorMode === m.id} onClick={() => changeMode(m.id)}
+              <button key={m.id} aria-pressed={editorMode === m.id} onClick={() => changeMode(m.id)} disabled={isTutorialView || (isPiano && m.id === 'SYMBOL')}
                 title={`${m.label} 모드 (${m.key})`}>{m.label}</button>
             ))}
           </div>
         </div>
 
         <div className="tool-group" role="group" aria-label="재생">
-          <button className="tbtn" onClick={() => handlePlay('ALL')} title="처음부터 재생"><IconPlayFromStart /></button>
-          <button className="tbtn" onClick={() => handlePlay('MEASURE')} title="커서가 있는 마디부터 재생 (Space)"><IconPlayMeasure /></button>
-          <button className="tbtn" onClick={() => handlePlay('CURSOR')} title="커서 위치부터 재생"><IconPlay /></button>
-          <button className={`tbtn${isRecording ? ' is-recording' : ''}`} onClick={() => handlePlay('RECORD')}
-            title="커서가 있는 마디부터 실시간 녹음 (한 마디 카운트인)"><IconRecord /></button>
-          <button className="tbtn" onClick={handleStop} title="정지 (Space)"><IconStop /></button>
-          <button className="tbtn" aria-pressed={isMetronome} onClick={() => setIsMetronome(!isMetronome)} title="메트로놈 켜기/끄기"><IconMetronome /></button>
+          {isTutorialView ? (
+            <>
+              <button className="tbtn" onClick={() => handlePlayTutorial(true)} title="튜토를 처음부터 재생"><IconPlayFromStart /></button>
+              <button className="tbtn" onClick={() => handlePlayTutorial()} title="튜토를 지금 위치부터 재생 (Space)"><IconPlay /></button>
+            </>
+          ) : (
+            <>
+              <button className="tbtn" onClick={() => handlePlay('ALL')} title="처음부터 재생"><IconPlayFromStart /></button>
+              <button className="tbtn" onClick={() => handlePlay('MEASURE')} title="커서가 있는 마디부터 재생 (Space)"><IconPlayMeasure /></button>
+              <button className="tbtn" onClick={() => handlePlay('CURSOR')} title="커서 위치부터 재생"><IconPlay /></button>
+              <button className={`tbtn${isRecording ? ' is-recording' : ''}`} onClick={() => handlePlay('RECORD')}
+                title="커서가 있는 마디부터 실시간 녹음 (한 마디 카운트인)"><IconRecord /></button>
+            </>
+          )}
+          <button className="tbtn" onClick={handleStop} title={isTutorialView ? '멈춤 (Space, 그 자리에서 멈춤)' : '정지 (Space)'}><IconStop /></button>
+          <button className="tbtn" aria-pressed={isMetronome} onClick={() => setIsMetronome(!isMetronome)} disabled={isTutorialView} title="메트로놈 켜기/끄기"><IconMetronome /></button>
         </div>
 
         <div className="tool-group">
@@ -1405,6 +1557,7 @@ export default function TabEditor() {
             type="number"
             value={bpm}
             onChange={(e) => setBpm(Number(e.target.value))}
+            disabled={isTutorialView}
             onKeyDown={(e) => { if (e.key === 'Enter' || e.key === 'Escape') e.currentTarget.blur(); }}
             aria-label="BPM"
           />
@@ -1413,6 +1566,7 @@ export default function TabEditor() {
             className="field"
             value={cursorTimeSig.num}
             onChange={(e) => { handleTimeSigChange(Number(e.target.value), cursorTimeSig.den); e.target.blur(); }}
+            disabled={isTutorialView}
             aria-label="박자표 분자"
           >
             {Array.from({ length: MAX_TIME_SIG_NUM }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
@@ -1422,6 +1576,7 @@ export default function TabEditor() {
             className="field"
             value={cursorTimeSig.den}
             onChange={(e) => { handleTimeSigChange(cursorTimeSig.num, Number(e.target.value)); e.target.blur(); }}
+            disabled={isTutorialView}
             aria-label="박자표 분모"
           >
             {TIME_SIG_DENOMINATORS.map(d => <option key={d} value={d}>{d}</option>)}
@@ -1430,14 +1585,78 @@ export default function TabEditor() {
 
         {/* 선택 모드에서만 쓰는 편집 (한 번 누르면 한 번 실행) */}
         <div className="tool-group" role="group" aria-label="선택한 노트 편집">
-          <button className="tbtn" onClick={handleSetSelectedLength} disabled={!isSelectMode}
+          <button className="tbtn" onClick={handleSetSelectedLength} disabled={!isSelectMode || isTutorialView}
             title={`선택한 노트 길이를 현재 박자(${formatBeats(currentStep)}박)로 맞추고 뒤 노트를 당기거나 밂 (선택 모드)`}>
             <IconSetLength />{formatBeats(currentStep)}박으로
           </button>
-          <button className="tbtn" onClick={handleExtendToNextNote} disabled={!isSelectMode}
+          <button className="tbtn" onClick={handleExtendToNextNote} disabled={!isSelectMode || isTutorialView}
             title="선택한 노트를 다음 노트가 있는 위치까지 늘림 (선택 모드)">
             <IconExtend />다음 노트까지
           </button>
+        </div>
+
+        {/* 여기서 줄바꿈: 보기·음색·파일은 둘째 줄 */}
+        <div className="toolbar-break" />
+
+        <div className="tool-group">
+          <div className="seg" role="group" aria-label="악기">
+            <button aria-pressed={!isPiano} onClick={() => changeInstrument('guitar')} disabled={isTutorialView}
+              title="기타: E2 이상, 한 박자 6음까지. TAB 있음">기타</button>
+            <button aria-pressed={isPiano} onClick={() => changeInstrument('piano')} disabled={isTutorialView}
+              title="피아노: 음 범위·개수 제한 없음. 큰보표로 봄 (TAB 없음)">피아노</button>
+          </div>
+        </div>
+
+        <div className="tool-group">
+          <div className="seg" role="group" aria-label="보기">
+            {VIEWS.map(v => {
+              const noNotes = v.id === VIEW_TUTORIAL && !hasPitchedNotes;
+              const noTab = isPiano && (v.id === VIEW_TAB || v.id === VIEW_BOTH); // 피아노에는 TAB이 없음
+              const pressed = v.id === VIEW_TUTORIAL ? isTutorialView : (!isTutorialView && scoreView === v.id);
+              return (
+                <button key={v.id} aria-pressed={pressed} disabled={noNotes || noTab}
+                  onClick={() => {
+                    if (playbackState !== 'STOPPED') handleStop();
+                    // 튜토에서 악보로 돌아갈 때: 튜토에서 보던 마디로 커서를 옮김
+                    if (isTutorialView && v.id !== VIEW_TUTORIAL && rollRef.current) {
+                      const n = measureAt(timeline, Math.max(0, rollRef.current.getTime() + TUTORIAL_LEAD_SEC));
+                      setCursor({ mIndex: Math.min(n - 1, score.length - 1), time: 0 });
+                    }
+                    setView(v.id);
+                  }}
+                  title={noNotes ? '튜토: 악보에 음을 넣으면 피아노 튜토리얼로 볼 수 있음'
+                    : noTab ? `${v.label}: 피아노 악보에는 TAB이 없음`
+                    : v.id === VIEW_TUTORIAL ? '보기: 악보를 피아노 튜토리얼로' : `보기: ${v.label}`}>
+                  {v.label}
+                </button>
+              );
+            })}
+          </div>
+          {/* 오선보가 보일 때만: 높은음 / 큰보표 (기타만), 큰보표면 나누는 음 */}
+          {!isTutorialView && scoreView !== VIEW_TAB && (
+            <>
+              {!isPiano && <div className="seg" role="group" aria-label="오선보 종류" style={{ marginLeft: '8px' }}>
+                <button aria-pressed={!notation.grand} onClick={() => setNotation({ ...notation, grand: false })}
+                  title="높은음자리표 하나 (기타 관례: 실제 소리보다 한 옥타브 높게 적음)">높은음</button>
+                <button aria-pressed={notation.grand} onClick={() => setNotation({ ...notation, grand: true })}
+                  title="큰보표: 높은음자리표 + 낮은음자리표 (피아노 악보, 실제 소리 높이)">큰보표</button>
+              </div>}
+              {drawNotation.grand && (
+                <>
+                  <span className="tool-label" style={{ marginLeft: '8px' }} title="이 음부터 위는 높은음자리표, 아래는 낮은음자리표">나눔</span>
+                  <select
+                    className="field"
+                    value={notation.split}
+                    onChange={(e) => { setNotation({ ...notation, split: Number(e.target.value) }); e.target.blur(); }}
+                    aria-label="큰보표 나누는 음"
+                    title="이 음부터 위는 높은음자리표, 아래는 낮은음자리표"
+                  >
+                    {SPLIT_CHOICES.map(p => <option key={p} value={p}>{pitchLabel(p)}{p === 60 ? ' (가운데 도)' : ''}</option>)}
+                  </select>
+                </>
+              )}
+            </>
+          )}
         </div>
 
         <div className="tool-group">
@@ -1472,6 +1691,10 @@ export default function TabEditor() {
             <IconOpen />
             <input type="file" accept=".json" style={{ display: 'none' }} onChange={handleImportJSON} />
           </label>
+          <label className="tbtn" title="MIDI 파일을 원곡으로 가져오기 (기타 악보는 그대로)">
+            <IconMidi />MIDI 가져오기
+            <input type="file" accept=".mid,.midi,audio/midi,audio/x-midi" style={{ display: 'none' }} onChange={handleImportMidi} />
+          </label>
           <button className="tbtn" onClick={handleExportJSON} title="악보를 파일(JSON)로 저장"><IconSave /></button>
           <button className="tbtn" onClick={handleResetScore} title="새 악보 (지금 악보를 지우고 새로 시작)"><IconNew /></button>
         </div>
@@ -1487,165 +1710,71 @@ export default function TabEditor() {
 
       {/* 작업 영역: 회색 바탕 위의 악보 종이 */}
       <div className="workspace">
+        <div className="sheet-column">
+        {/* 원곡 정보는 악보 보기에서만 (튜토는 튜토리얼 화면만) */}
+        {source && !isTutorialView && <SourcePanel source={source} onClear={handleClearSource} />}
+        {cacheFull && (
+          <p className="cache-warning" role="alert">
+            원곡이 커서 브라우저에 자동 저장하지 못했습니다. 닫기 전에 저장 버튼으로 파일을 받아 두세요.
+          </p>
+        )}
         <div className="page" ref={scoreAreaRef}>
-          <div ref={playheadRef} className="playhead" style={{ height: `${PLAYHEAD_HEIGHT}px` }} />
-
-          {layout.map((lineChunks, lineIdx) => (
-            <div key={`line-${lineIdx}`} className="score-line">
-
-              {/* 줄 머리: 시스템 시작 세로줄 + TAB 표시 */}
-              <svg width={CLEF_WIDTH} height={HEIGHT} aria-hidden="true">
-                {[...Array(STRING_COUNT)].map((_, i) => (
-                  <line key={i} x1="0" y1={TOP_PADDING + i * STRING_SPACING} x2={CLEF_WIDTH} y2={TOP_PADDING + i * STRING_SPACING} style={{ stroke: 'var(--staff)' }} strokeWidth="1" />
-                ))}
-                <line x1="0.75" y1={TOP_PADDING} x2="0.75" y2={TOP_PADDING + STRING_SPACING * 5} style={{ stroke: 'var(--ink)' }} strokeWidth="1.5" />
-                {/* 글자마다 그 자리의 줄만 종이색으로 지움 */}
-                {['T', 'A', 'B'].map((ch, i) => (
-                  <g key={ch}>
-                    <rect x="9" y={TOP_PADDING + 20 + i * 22} width="14" height="16" style={{ fill: 'var(--page)' }} />
-                    <text x="16" y={TOP_PADDING + 33 + i * 22} textAnchor="middle" fontSize="17" fontWeight="700"
-                      style={{ fill: 'var(--ink)', fontFamily: FRET_FONT }}>{ch}</text>
-                  </g>
-                ))}
-              </svg>
-
-              {lineChunks.map((chunk, chunkIdx) => {
-                const svgWidth = chunk.width * UNIT;
-                const timeRange = chunk.timeEnd - chunk.timeStart;
-                const isCursorHere = cursor.mIndex === chunk.mIndex && cursor.time >= chunk.timeStart && cursor.time < chunk.timeEnd;
-                const innerWidth = svgWidth - (SIDE_PADDING * 2);
-                let cursorX = 0;
-                if (isCursorHere) cursorX = SIDE_PADDING + ((cursor.time - chunk.timeStart) / timeRange) * innerWidth;
-                const startsMeasure = chunk.type === 'full' || chunk.type === 'start';
-                const endsMeasure = chunk.type === 'full' || chunk.type === 'end';
-
-                return (
-                  <svg
-                    key={`chunk-${chunk.measureId}-${chunkIdx}`}
-                    ref={(el) => {
-                      const k = `${lineIdx}-${chunkIdx}`;
-                      if (el) chunkElsRef.current[k] = el; else delete chunkElsRef.current[k];
-                    }}
-                    width={svgWidth}
-                    height={HEIGHT}
-                    style={{ overflow: 'visible', cursor: editorMode === 'INPUT' ? 'pointer' : 'default' }}
-                    onClick={(e) => {
-                      // 입력 모드에서만 클릭으로 커서 이동
-                      if (editorMode !== 'INPUT') return;
-
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      const clickX = e.clientX - rect.left;
-
-                      let timeRatio = (clickX - SIDE_PADDING) / innerWidth;
-                      if (timeRatio < 0) timeRatio = 0;
-                      if (timeRatio > 0.999) timeRatio = 0.999;
-
-                      // 설정된 박자 단위(step)에 맞춰 내림 연산 후 스냅
-                      const exactTime = chunk.timeStart + timeRatio * timeRange;
-                      setCursor({ mIndex: chunk.mIndex, time: Math.floor(exactTime / currentStep) * currentStep });
-                    }}
-                  >
-                    {[...Array(STRING_COUNT)].map((_, i) => (
-                      <line key={i} x1="0" y1={TOP_PADDING + i * STRING_SPACING} x2={svgWidth} y2={TOP_PADDING + i * STRING_SPACING} style={{ stroke: 'var(--staff)' }} strokeWidth="1" />
-                    ))}
-
-                    {endsMeasure && <line x1={svgWidth} y1={TOP_PADDING} x2={svgWidth} y2={TOP_PADDING + STRING_SPACING * 5} style={{ stroke: 'var(--ink)' }} strokeWidth="1.2" />}
-
-                    {/* 마디 번호 */}
-                    {startsMeasure && (
-                      <text x="2" y={TOP_PADDING - 8} fontSize="10" fontStyle="italic" style={{ fill: 'var(--muted)' }}>{chunk.mIndex + 1}</text>
-                    )}
-
-                    {/* 박자표 (첫 마디 또는 박자가 바뀌는 마디): 분자 위, 분모 아래로 겹쳐 씀 */}
-                    {chunk.showTimeSig && (
-                      <g style={{ fill: 'var(--ink)', fontFamily: FRET_FONT }} fontWeight="700" fontSize="11" textAnchor="middle">
-                        <text x={SIDE_PADDING} y={TOP_PADDING - 21}>{chunk.timeSig.num}</text>
-                        <text x={SIDE_PADDING} y={TOP_PADDING - 10}>{chunk.timeSig.den}</text>
-                      </g>
-                    )}
-
-                    {isCursorHere && <rect x={cursorX - 9} y={TOP_PADDING - 7} width="18" height={STRING_SPACING * 5 + 19} style={{ fill: 'var(--accent-soft)' }} />}
-
-                    {chunk.beats.map((beat, bIdx) => {
-                      const xPos = SIDE_PADDING + ((beat.time - chunk.timeStart) / timeRange) * innerWidth;
-                      return (
-                        <g key={bIdx}>
-                          {Object.entries(beat.notes).map(([string, fret]) => {
-                            const strIdx = parseInt(string, 10) - 1;
-                            const yPos = TOP_PADDING + strIdx * STRING_SPACING;
-
-                            const tie = tieInfo[`${chunk.mIndex}-${beat.time}`];
-                            const isTieStart = !!(tie && tie.hasNext); // 다음 조각으로 이어짐
-                            const isTieEnd = !!(tie && tie.hasPrev);   // 앞 조각에서 이어져 옴
-
-                            const isLastChunk = chunkIdx === lineChunks.length - 1;
-                            const isFirstChunk = chunkIdx === 0;
-                            const isSelected = selectedNotes.some(sel => sel.mIndex === chunk.mIndex && sel.time === beat.time && sel.string === strIdx + 1);
-                            const tieStyle = { stroke: 'var(--ink)', fill: 'none' };
-                            const label = String(fret);
-                            const boxW = label.length > 1 ? 16 : 11;
-
-                            return (
-                              <g key={string}>
-                                {/* 붙임줄: 같은 줄 안에서 다음 마디로 */}
-                                {isTieStart && !isLastChunk && (
-                                  <path d={`M ${xPos + 6} ${yPos + 10} Q ${(xPos + svgWidth + SIDE_PADDING) / 2} ${yPos + 20} ${svgWidth + SIDE_PADDING - 6} ${yPos + 10}`}
-                                    style={tieStyle} strokeWidth="1.2" strokeLinecap="round" />
-                                )}
-                                {/* 붙임줄: 줄 끝에서 다음 줄로 나감 */}
-                                {isTieStart && isLastChunk && (
-                                  <path d={`M ${xPos + 6} ${yPos + 10} Q ${xPos + 30} ${yPos + 19} ${svgWidth + 15} ${yPos + 16}`}
-                                    style={tieStyle} strokeWidth="1.2" strokeLinecap="round" />
-                                )}
-                                {/* 붙임줄: 앞 줄에서 들어옴 */}
-                                {isTieEnd && isFirstChunk && (
-                                  <path d={`M -15 ${yPos + 16} Q ${xPos - 30} ${yPos + 19} ${xPos - 6} ${yPos + 10}`}
-                                    style={tieStyle} strokeWidth="1.2" strokeLinecap="round" />
-                                )}
-
-                                {/* 프렛 번호: 뒤의 줄을 종이색으로 지우고 씀 (선택 시 반전) */}
-                                <rect x={xPos - boxW / 2} y={yPos - 7} width={boxW} height="14" rx="1.5"
-                                  style={{ fill: isSelected ? 'var(--accent)' : 'var(--page)' }} />
-                                <text x={xPos} y={yPos + 4.5} fontSize="13" fontWeight="600" textAnchor="middle"
-                                  style={{ fill: isSelected ? 'var(--accent-text)' : 'var(--ink)', fontFamily: FRET_FONT }}>
-                                  {label}
-                                </text>
-                              </g>
-                            );
-                          })}
-                        </g>
-                      );
-                    })}
-                  </svg>
-                );
-              })}
-            </div>
-          ))}
+          {/* 재생 진행 바 (재생 중에만 표시, 위치는 updatePlayhead가 매 프레임 갱신) */}
+          <div ref={playheadRef} className="playhead" />
+          {isTutorialView ? (
+            <PianoRoll timeline={timeline} theme={theme} playing={playbackState === 'PLAYING'} controlRef={rollRef} />
+          ) : (
+          <ScoreView
+            score={score}
+            view={scoreView}
+            tieInfo={tieInfo}
+            theme={theme}
+            notation={drawNotation}
+            cursor={cursor}
+            selectedNotes={selectedNotes}
+            step={currentStep}
+            clickable={editorMode === 'INPUT'}
+            onPickPosition={setCursor}
+            engravingRef={engravingRef}
+            lineElsRef={lineElsRef}
+          />
+          )}
+        </div>
         </div>
       </div>
 
       {/* 상태 줄 + 건반 */}
       <div className="statusbar">
         <div className="status-row">
+          {isTutorialView ? (
+            <>
+              <span className="status-cell">보기 <b>튜토</b></span>
+              <span className="status-cell">재생/멈춤 <kbd>Space</kbd></span>
+              <span className="status-cell">멈춰 있을 때 마우스 휠로 앞뒤 이동</span>
+              <span className="status-cell">편집은 오선보·TAB 보기에서</span>
+            </>
+          ) : (<>
           <span className="status-cell">모드 <b>{MODES.find(m => m.id === editorMode).label}</b></span>
           <span className="status-cell">{MODE_HINTS[editorMode]}</span>
-          <span className="status-cell">길이 <b>{formatBeats(currentStep)}박</b> <kbd>-</kbd><kbd>=</kbd></span>
+          <span className="status-cell">길이 <b>{formatBeats(currentStep)}박</b> <kbd>-</kbd><kbd>+</kbd></span>
           <span className={`status-cell${isDotted ? ' on' : ''}`}>점음표 <b>{isDotted ? '켬' : '끔'}</b> <kbd>\</kbd></span>
           <span className={`status-cell${isOctaveDown ? ' on' : ''}`}>한 옥타브 아래 <b>{isOctaveDown ? '켬' : '끔'}</b> <kbd>Shift</kbd></span>
           <span className="status-cell">위치 <b>{cursor.mIndex + 1}마디 {cursorBeat}박</b></span>
+          </>)}
           <span className={`status-msg${status && status.isError ? ' error' : ''}`} role="status" aria-live="polite">
             {status ? status.text : ''}
           </span>
         </div>
 
-        <div className="keyboard" aria-hidden="true">
+        {/* 컴퓨터 키보드 안내: 악보 입력용이라 튜토에서는 숨김 */}
+        {!isTutorialView && <div className="keyboard" aria-hidden="true">
           <div className="key-row">
             {TOP_ROW.map((keyData) => <PianoKey key={keyData.w} whiteLabel={keyData.w} blackLabel={keyData.b} />)}
           </div>
           <div className="key-row">
             {BOTTOM_ROW.map((keyData) => <PianoKey key={keyData.w} whiteLabel={keyData.w} blackLabel={keyData.b} />)}
           </div>
-        </div>
+        </div>}
       </div>
 
       {/* 단축키 안내 */}
@@ -1680,6 +1809,22 @@ export default function TabEditor() {
             <h3>기호 모드 (<kbd>]</kbd>로 들어가고 나옴)</h3>
             <table><tbody>
               <tr><td><kbd>1</kbd> ~ <kbd>6</kbd></td><td>해당 줄에 뮤트(X)</td></tr>
+            </tbody></table>
+
+            <h3>보기</h3>
+            <table><tbody>
+              <tr><td>오선보 / 둘 다 / TAB</td><td>악보 표시 방식. 편집과 재생은 어느 보기에서나 같음</td></tr>
+              <tr><td>기타 / 피아노</td><td>악기. 기타: E2 이상, 한 박자 6음까지, TAB 있음. 피아노: 음 범위·개수 제한 없음, 큰보표로 봄. 피아노 → 기타로 바꾸면 줄을 자동으로 정하고, 칠 수 없는 음은 빨간색(TAB 위 ?)으로 남김. ↑↓로 옮기면 줄에 놓임</td></tr>
+              <tr><td>높은음 / 큰보표</td><td>오선보 종류. 높은음: 기타 관례대로 실제 소리보다 한 옥타브 높게 (음자리표 아래 8). 큰보표: 피아노 악보처럼 높은음자리표 + 낮은음자리표, 실제 소리 높이</td></tr>
+              <tr><td>나눔</td><td>큰보표에서 이 음부터 위는 높은음자리표, 아래는 낮은음자리표</td></tr>
+              <tr><td>(숫자)</td><td>TAB에서 앞 음에 붙임줄로 이어진 음 (다시 치지 않음)</td></tr>
+              <tr><td>튜토</td><td>악보를 피아노 튜토리얼로: 떨어지는 막대가 건반에 닿을 때 그 음을 침. 커서가 있던 마디에서 시작하고, 악보로 돌아가면 튜토에서 보던 마디로 커서가 옴. 멈추면 그 자리에서 이어서, 멈춰 있을 때 마우스 휠로 앞뒤 이동. 편집은 다른 보기에서</td></tr>
+            </tbody></table>
+
+            <h3>파일</h3>
+            <table><tbody>
+              <tr><td>MIDI 가져오기</td><td>MIDI 파일의 음을 전부 원곡으로 보관 (기타 악보는 그대로)</td></tr>
+              <tr><td>열기 / 저장</td><td>기타 악보와 원곡을 JSON 파일 하나로</td></tr>
             </tbody></table>
 
             <h3>재생</h3>

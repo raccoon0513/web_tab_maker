@@ -72,3 +72,8 @@ export const IconMoon = () => (
 export const IconHelp = () => (
   <Svg><circle cx="8" cy="8" r="6.2" /><path d="M6.2 6.3a1.9 1.9 0 1 1 2.6 1.8c-.5.2-.8.6-.8 1.1v.4" /><circle cx="8" cy="11.6" r="0.4" fill="currentColor" /></Svg>
 );
+
+// MIDI 가져오기: 8분음표
+export const IconMidi = () => (
+  <Svg><path d="M6.5 12V3.5l6-1.5v8" /><circle cx="4.8" cy="12" r="1.8" fill="currentColor" /><circle cx="10.8" cy="10" r="1.8" fill="currentColor" /></Svg>
+);

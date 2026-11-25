@@ -12,7 +12,8 @@
   "dependencies": {
     "@tonejs/midi": "^2.0.28",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "vexflow": "^5.9.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
